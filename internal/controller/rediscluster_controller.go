@@ -285,16 +285,19 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Deterministic order so repeated reconciles behave identically.
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].PodName < nodes[j].PodName })
 
-	// 5. Bootstrap the Redis cluster if it isn't formed yet. Guarded so
-	// this is idempotent -- an already-healthy cluster is never touched.
-	if !isBootstrapped(ctx, nodes) {
-		log.Info("bootstrapping redis cluster", "pods", len(nodes), "masters", redisCluster.Spec.Nodes)
-		if err := bootstrapCluster(ctx, nodes, int(redisCluster.Spec.Nodes)); err != nil {
-			log.Error(err, "bootstrap failed, will retry")
+	// 5. Bootstrap (or resume) the Redis cluster until the full slot map
+	// is assigned and planned replicas are attached. needsBootstrap is
+	// true for empty AND partial formation; bootstrapCluster itself is
+	// idempotent so a mid-flight failure can recover on the next cycle.
+	numMasters := int(redisCluster.Spec.Nodes)
+	if needsBootstrap(ctx, nodes, numMasters) {
+		log.Info("Bootstrapping Redis cluster", "pods", len(nodes), "masters", numMasters)
+		if err := bootstrapCluster(ctx, nodes, numMasters); err != nil {
+			log.Error(err, "Bootstrap failed, will retry")
 			_ = r.setPhase(ctx, &redisCluster, "Bootstrapping", 0, 0)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		log.Info("bootstrap complete")
+		log.Info("Bootstrap complete")
 		// Give gossip a moment to settle before reporting roles.
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
