@@ -312,37 +312,56 @@ func syncHeadlessService(existing *corev1.Service, desired *corev1.Service) bool
 }
 
 // syncStatefulSetTemplate copies mutable pod-template fields we own from
-// desired onto existing. Only compares explicit fields (image, resources,
-// command, topology spread) -- full Template DeepEqual fights API-server
-// defaulting and causes perpetual update loops.
+// desired onto existing. Only compares explicit fields -- full Template
+// DeepEqual fights API-server defaulting and causes perpetual update loops.
 func syncStatefulSetTemplate(existing, desired *appsv1.StatefulSet) bool {
 	changed := false
 	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
 		existing.Labels = desired.Labels
 		changed = true
 	}
-	eC := redisContainer(&existing.Spec.Template.Spec)
-	dC := redisContainer(&desired.Spec.Template.Spec)
+	eSpec := &existing.Spec.Template.Spec
+	dSpec := &desired.Spec.Template.Spec
+	if !reflect.DeepEqual(eSpec.SecurityContext, dSpec.SecurityContext) {
+		eSpec.SecurityContext = dSpec.SecurityContext.DeepCopy()
+		changed = true
+	}
+	eC := redisContainer(eSpec)
+	dC := redisContainer(dSpec)
 	if eC != nil && dC != nil {
 		if eC.Image != dC.Image {
 			eC.Image = dC.Image
 			changed = true
 		}
 		if !reflect.DeepEqual(eC.Resources, dC.Resources) {
-			eC.Resources = dC.Resources
+			eC.Resources = *dC.Resources.DeepCopy()
 			changed = true
 		}
 		if !reflect.DeepEqual(eC.Command, dC.Command) {
 			eC.Command = append([]string(nil), dC.Command...)
 			changed = true
 		}
+		if !reflect.DeepEqual(eC.SecurityContext, dC.SecurityContext) {
+			eC.SecurityContext = dC.SecurityContext.DeepCopy()
+			changed = true
+		}
+		if !reflect.DeepEqual(eC.ReadinessProbe, dC.ReadinessProbe) {
+			eC.ReadinessProbe = dC.ReadinessProbe.DeepCopy()
+			changed = true
+		}
+		if !reflect.DeepEqual(eC.LivenessProbe, dC.LivenessProbe) {
+			eC.LivenessProbe = dC.LivenessProbe.DeepCopy()
+			changed = true
+		}
 	}
 	if !reflect.DeepEqual(
-		existing.Spec.Template.Spec.TopologySpreadConstraints,
-		desired.Spec.Template.Spec.TopologySpreadConstraints,
+		eSpec.TopologySpreadConstraints,
+		dSpec.TopologySpreadConstraints,
 	) {
-		existing.Spec.Template.Spec.TopologySpreadConstraints =
-			desired.Spec.Template.Spec.TopologySpreadConstraints
+		eSpec.TopologySpreadConstraints = append(
+			[]corev1.TopologySpreadConstraint(nil),
+			dSpec.TopologySpreadConstraints...,
+		)
 		changed = true
 	}
 	return changed
