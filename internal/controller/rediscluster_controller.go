@@ -66,6 +66,9 @@ func nodeInclusionPolicyPtr(p corev1.NodeInclusionPolicy) *corev1.NodeInclusionP
 	return &p
 }
 
+func pointerBool(v bool) *bool       { return &v }
+func pointerInt64(v int64) *int64    { return &v }
+
 // desiredHeadlessService builds the governing headless Service every
 // StatefulSet requires for stable pod network identity.
 func desiredHeadlessService(rc *cachev1.RedisCluster) *corev1.Service {
@@ -134,6 +137,15 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 					// two DIFFERENT hard rules fought over the same
 					// pods). 6 pods / 3 nodes divides evenly, so this
 					// will always be satisfiable.
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: pointerBool(true),
+						RunAsUser:    pointerInt64(999), // redis user in official image
+						RunAsGroup:   pointerInt64(1000),
+						FSGroup:      pointerInt64(1000),
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
 					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
 						{
 							MaxSkew:           1,
@@ -173,6 +185,10 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 								"--cluster-config-file", "/data/nodes.conf",
 								"--cluster-node-timeout", "5000",
 								"--appendonly", "yes",
+								// NOTE: protected-mode stays off until the API
+								// grows password/ACL/TLS fields -- enabling it
+								// without auth would block all remote clients
+								// including the operator itself.
 								"--protected-mode", "no",
 								"--bind", "0.0.0.0",
 								// baked in from day one -- this exact
@@ -186,6 +202,32 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 								{Name: "gossip", ContainerPort: 16379},
 							},
 							Resources: rc.Spec.Resources,
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: pointerBool(false),
+								ReadOnlyRootFilesystem:   pointerBool(false), // AOF + nodes.conf under /data
+								RunAsNonRoot:             pointerBool(true),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(6379)},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       5,
+								TimeoutSeconds:      2,
+								FailureThreshold:    3,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(6379)},
+								},
+								InitialDelaySeconds: 15,
+								PeriodSeconds:       10,
+								TimeoutSeconds:      2,
+								FailureThreshold:    3,
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "data", MountPath: "/data"},
 							},
