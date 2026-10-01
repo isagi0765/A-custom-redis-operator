@@ -18,13 +18,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -74,11 +77,76 @@ func desiredHeadlessService(rc *cachev1.RedisCluster) *corev1.Service {
 			ClusterIP: corev1.ClusterIPNone,
 			Selector:  labelsFor(rc.Name),
 			Ports: []corev1.ServicePort{
-				{Name: "redis", Port: 6379, TargetPort: intstr.FromInt32(6379)},
-				{Name: "gossip", Port: 16379, TargetPort: intstr.FromInt32(16379)},
+				{Name: "redis", Port: 6379, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(6379)},
+				{Name: "gossip", Port: 16379, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(16379)},
 			},
 		},
 	}
+}
+
+func syncHeadlessService(existing, desired *corev1.Service) bool {
+	changed := !reflect.DeepEqual(existing.Labels, desired.Labels) ||
+		!reflect.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) ||
+		!reflect.DeepEqual(existing.Spec.Ports, desired.Spec.Ports)
+	if changed {
+		existing.Labels = desired.Labels
+		existing.Spec.Selector = desired.Spec.Selector
+		existing.Spec.Ports = desired.Spec.Ports
+	}
+	return changed
+}
+
+func statefulSetUnsupportedChange(existing, desired *appsv1.StatefulSet) string {
+	existingReplicas := int32(1)
+	if existing.Spec.Replicas != nil {
+		existingReplicas = *existing.Spec.Replicas
+	}
+	if desired.Spec.Replicas != nil && existingReplicas != *desired.Spec.Replicas {
+		return "changing node or replica counts requires Redis Cluster resharding"
+	}
+	if existing.Spec.ServiceName != desired.Spec.ServiceName ||
+		!reflect.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) ||
+		storageTemplatesDiffer(existing.Spec.VolumeClaimTemplates, desired.Spec.VolumeClaimTemplates) {
+		return "changing the StatefulSet service, selector, or storage template is not supported in place"
+	}
+	return ""
+}
+
+func storageTemplatesDiffer(existing, desired []corev1.PersistentVolumeClaim) bool {
+	if len(existing) != len(desired) {
+		return true
+	}
+	for i := range existing {
+		oldClaim, newClaim := existing[i], desired[i]
+		if oldClaim.Name != newClaim.Name ||
+			!reflect.DeepEqual(oldClaim.Spec.AccessModes, newClaim.Spec.AccessModes) ||
+			storageClassName(oldClaim.Spec.StorageClassName) != storageClassName(newClaim.Spec.StorageClassName) {
+			return true
+		}
+		oldStorage, oldHasStorage := oldClaim.Spec.Resources.Requests[corev1.ResourceStorage]
+		newStorage, newHasStorage := newClaim.Spec.Resources.Requests[corev1.ResourceStorage]
+		if oldHasStorage != newHasStorage || (oldHasStorage && oldStorage.Cmp(newStorage) != 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func storageClassName(name *string) string {
+	if name == nil {
+		return ""
+	}
+	return *name
+}
+
+func syncStatefulSetTemplate(existing, desired *appsv1.StatefulSet) bool {
+	changed := !reflect.DeepEqual(existing.Labels, desired.Labels) ||
+		!reflect.DeepEqual(existing.Spec.Template, desired.Spec.Template)
+	if changed {
+		existing.Labels = desired.Labels
+		existing.Spec.Template = desired.Spec.Template
+	}
+	return changed
 }
 
 // desiredStatefulSet builds the StatefulSet running all nodes as uniform
@@ -221,18 +289,22 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.Create(ctx, svc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("creating headless service: %w", err)
 		}
+		existingSvc = *svc
 	} else if err != nil {
 		return ctrl.Result{}, err
 	}
+	if syncHeadlessService(&existingSvc, svc) {
+		if err := r.Update(ctx, &existingSvc); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating headless service: %w", err)
+		}
+	}
 
-	// 2. StatefulSet -- create if missing.
+	// 2. StatefulSet -- create if missing, reconcile safe pod-template drift.
 	sts, err := desiredStatefulSet(&redisCluster)
 	if err != nil {
-		// A bad spec (e.g. unparseable storageSize) isn't something
-		// retrying will fix -- surface it in status instead of
-		// requeuing forever.
-		redisCluster.Status.Phase = "Failed"
-		_ = r.Status().Update(ctx, &redisCluster)
+		if statusErr := r.setPhase(ctx, &redisCluster, "Failed", 0, 0); statusErr != nil {
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
 		return ctrl.Result{}, err
 	}
 	if err := ctrl.SetControllerReference(&redisCluster, sts, r.Scheme); err != nil {
@@ -248,12 +320,52 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	} else if err != nil {
 		return ctrl.Result{}, err
 	}
+	if reason := statefulSetUnsupportedChange(&existingSts, sts); reason != "" {
+		log.Info("RedisCluster change requires an unsupported migration",
+			"reason", reason,
+			"currentReplicas", existingSts.Spec.Replicas,
+			"desiredReplicas", sts.Spec.Replicas,
+		)
+		if err := r.setPhase(ctx, &redisCluster, "UnsupportedChange",
+			redisCluster.Status.ReadyMasters, redisCluster.Status.ReadyReplicas); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if syncStatefulSetTemplate(&existingSts, sts) {
+		if err := r.Update(ctx, &existingSts); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating statefulset pod template: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.setPhase(ctx, &redisCluster, "Provisioning", 0, 0)
+	}
 
-	// 3. Nothing to do at the Redis level until every pod is actually
-	// running -- MEET against a pod that has no IP yet just fails.
-	if existingSts.Status.ReadyReplicas != *sts.Spec.Replicas {
-		log.Info("waiting for all pods to be ready",
-			"ready", existingSts.Status.ReadyReplicas, "desired", *sts.Spec.Replicas)
+	// 3. Wait for the current StatefulSet generation and all updated pods
+	// before issuing Redis commands.
+	if existingSts.Status.ObservedGeneration < existingSts.Generation ||
+		existingSts.Status.UpdatedReplicas != *sts.Spec.Replicas ||
+		existingSts.Status.ReadyReplicas != *sts.Spec.Replicas {
+		log.Info("Waiting for all pods to be ready",
+			"ready", existingSts.Status.ReadyReplicas,
+			"updated", existingSts.Status.UpdatedReplicas,
+			"observedGeneration", existingSts.Status.ObservedGeneration,
+			"generation", existingSts.Generation,
+			"desired", *sts.Spec.Replicas)
+
+		var pendingPods corev1.PodList
+		if err := r.List(ctx, &pendingPods,
+			client.InNamespace(redisCluster.Namespace),
+			client.MatchingLabels(labelsFor(redisCluster.Name)),
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("listing pods while provisioning: %w", err)
+		}
+		if unsched, msg := podsUnschedulable(pendingPods.Items); unsched {
+			log.Info("Pods are unschedulable", "detail", msg)
+			if err := r.setPhaseDetail(ctx, &redisCluster, "Failed", 0, 0,
+				"Unschedulable", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 		return ctrl.Result{}, r.setPhase(ctx, &redisCluster, "Provisioning", 0, 0)
 	}
 
@@ -268,13 +380,23 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("listing pods: %w", err)
 	}
 
+	if unsched, msg := podsUnschedulable(podList.Items); unsched {
+		log.Info("Pods are unschedulable", "detail", msg)
+		if err := r.setPhaseDetail(ctx, &redisCluster, "Failed", 0, 0,
+			"Unschedulable", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	nodes := make([]nodeInfo, 0, len(podList.Items))
 	for _, pod := range podList.Items {
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" {
 			// Still settling; come back shortly rather than acting on a
 			// half-known topology.
-			log.Info("pod not fully scheduled yet, requeueing", "pod", pod.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			log.Info("Pod not fully scheduled yet, requeueing", "pod", pod.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second},
+				r.setPhase(ctx, &redisCluster, "Provisioning", 0, 0)
 		}
 		nodes = append(nodes, nodeInfo{
 			PodName: pod.Name,
@@ -285,16 +407,33 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Deterministic order so repeated reconciles behave identically.
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].PodName < nodes[j].PodName })
 
-	// 5. Bootstrap the Redis cluster if it isn't formed yet. Guarded so
-	// this is idempotent -- an already-healthy cluster is never touched.
-	if !isBootstrapped(ctx, nodes) {
-		log.Info("bootstrapping redis cluster", "pods", len(nodes), "masters", redisCluster.Spec.Nodes)
-		if err := bootstrapCluster(ctx, nodes, int(redisCluster.Spec.Nodes)); err != nil {
-			log.Error(err, "bootstrap failed, will retry")
+	// Topology must be placeable before we touch Redis: one master per
+	// distinct Kubernetes node.
+	if _, _, err := planRoles(nodes, int(redisCluster.Spec.Nodes)); err != nil {
+		log.Info("RedisCluster topology is not placeable", "error", err)
+		if statusErr := r.setPhaseDetail(ctx, &redisCluster, "Failed", 0, 0,
+			"InsufficientNodes", err.Error()); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// 5. Bootstrap or resume a partial bootstrap. Idempotent helpers skip
+	// slots/replicas that are already correct so a mid-flight failure can
+	// recover. A fully formed cluster (all slots + linked replicas) is left
+	// alone even when gossip is temporarily inconsistent.
+	needsWork, err := needsBootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if needsWork {
+		log.Info("Bootstrapping Redis cluster", "pods", len(nodes), "masters", redisCluster.Spec.Nodes)
+		if err := bootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes)); err != nil {
+			log.Error(err, "Bootstrap failed, will retry")
 			_ = r.setPhase(ctx, &redisCluster, "Bootstrapping", 0, 0)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		log.Info("bootstrap complete")
+		log.Info("Bootstrap complete")
 		// Give gossip a moment to settle before reporting roles.
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -307,8 +446,15 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// once reporting "healthy" with a whole master missing.
 	assessment := assessHealth(ctx, nodes, len(nodes))
 	if !assessment.Complete {
-		log.Info("cluster view not yet consistent across all pods, will retry",
+		log.Info("Cluster view not yet consistent across all pods, will retry",
 			"queriedPod", assessment.QueriedPod, "issues", assessment.Issues)
+		if healed, healErr := healClusterMembership(ctx, nodes); healErr != nil {
+			log.Error(healErr, "Cluster membership heal failed")
+		} else if healed {
+			log.Info("Healed cluster membership (FORGET/MEET)")
+			_ = r.setPhase(ctx, &redisCluster, "Degraded", 0, 0)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 		_ = r.setPhase(ctx, &redisCluster, "Degraded", 0, 0)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -319,33 +465,38 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	parseClusterNodesText(assessment.RawNodes, byIP)
 
+	mastersReady, replicasReady := countRoles(nodes)
+	if !rolesMatchSpec(nodes, redisCluster.Spec.Nodes, redisCluster.Spec.ReplicasPerNode) {
+		msg := fmt.Sprintf("role counts do not match spec: masters=%d want=%d replicas=%d want=%d",
+			mastersReady, redisCluster.Spec.Nodes,
+			replicasReady, redisCluster.Spec.Nodes*redisCluster.Spec.ReplicasPerNode)
+		log.Info("Cluster roles do not match Spec", "detail", msg)
+		if err := r.setPhaseDetail(ctx, &redisCluster, "Degraded", mastersReady, replicasReady,
+			"RoleMismatch", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	// Only ever act on a view we've confirmed every pod agrees with --
 	// rebalanceMasters must never fire against a partial/stale view,
 	// which could misdiagnose a real imbalance or miss one entirely.
 	if acted, rbErr := rebalanceMasters(ctx, nodes); rbErr != nil {
-		log.Error(rbErr, "master rebalance check failed")
-		// Don't fail the whole reconcile over this -- still report
-		// current (imperfect) status below, and try again next cycle.
+		log.Error(rbErr, "Master rebalance check failed")
+		if err := r.setPhaseDetail(ctx, &redisCluster, "Degraded", mastersReady, replicasReady,
+			"UnresolvableMasterImbalance", rbErr.Error()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	} else if acted {
-		log.Info("issued CLUSTER FAILOVER to correct a same-node master imbalance")
+		log.Info("Issued CLUSTER FAILOVER to correct a same-node master imbalance")
 		// Give the failover a moment to complete before re-observing.
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// 7. Report observed roles (from the same data we already fetched
 	// above -- no need to re-query Redis a second time).
-	var mastersReady, replicasReady int32
-	for _, n := range nodes {
-		if n.NodeID == "" {
-			continue
-		}
-		if n.IsMaster {
-			mastersReady++
-		} else {
-			replicasReady++
-		}
-	}
-	log.Info("cluster healthy", "masters", mastersReady, "replicas", replicasReady)
+	log.Info("Cluster healthy", "masters", mastersReady, "replicas", replicasReady)
 	if err := r.setPhase(ctx, &redisCluster, "Ready", mastersReady, replicasReady); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -357,20 +508,130 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
+// podsUnschedulable reports whether any pod is stuck with
+// PodScheduled=False / Unschedulable.
+func podsUnschedulable(pods []corev1.Pod) (bool, string) {
+	for _, pod := range pods {
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodScheduled &&
+				cond.Status == corev1.ConditionFalse &&
+				cond.Reason == corev1.PodReasonUnschedulable {
+				msg := cond.Message
+				if msg == "" {
+					msg = "pod is unschedulable"
+				}
+				return true, fmt.Sprintf("%s: %s", pod.Name, msg)
+			}
+		}
+	}
+	return false, ""
+}
+
 // setPhase writes status only when something actually changed, so we don't
 // generate a self-triggering write loop on every reconcile.
 func (r *RedisClusterReconciler) setPhase(
 	ctx context.Context, rc *cachev1.RedisCluster, phase string, masters, replicas int32,
 ) error {
-	if rc.Status.Phase == phase &&
-		rc.Status.ReadyMasters == masters &&
-		rc.Status.ReadyReplicas == replicas {
+	return r.setPhaseDetail(ctx, rc, phase, masters, replicas, "", "")
+}
+
+func (r *RedisClusterReconciler) setPhaseDetail(
+	ctx context.Context, rc *cachev1.RedisCluster, phase string, masters, replicas int32,
+	reason, message string,
+) error {
+	if !updateRedisClusterStatusDetail(rc, phase, masters, replicas, reason, message) {
 		return nil
 	}
+	return r.Status().Update(ctx, rc)
+}
+
+func updateRedisClusterStatus(rc *cachev1.RedisCluster, phase string, masters, replicas int32) bool {
+	return updateRedisClusterStatusDetail(rc, phase, masters, replicas, "", "")
+}
+
+func updateRedisClusterStatusDetail(
+	rc *cachev1.RedisCluster, phase string, masters, replicas int32, reason, message string,
+) bool {
+	oldStatus := rc.Status
+	oldStatus.Conditions = append([]metav1.Condition(nil), rc.Status.Conditions...)
 	rc.Status.Phase = phase
 	rc.Status.ReadyMasters = masters
 	rc.Status.ReadyReplicas = replicas
-	return r.Status().Update(ctx, rc)
+
+	defaultReason, defaultMessage := phaseConditionDetails(phase)
+	if reason == "" {
+		reason = defaultReason
+	}
+	if message == "" {
+		message = defaultMessage
+	}
+	ready := phase == "Ready"
+	progressing := phase == "Provisioning" || phase == "Bootstrapping"
+	degraded := phase == "Degraded" || phase == "Failed" || phase == "UnsupportedChange"
+	conditions := []metav1.Condition{
+		{
+			Type:               "Ready",
+			Status:             conditionStatus(ready),
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: rc.Generation,
+			LastTransitionTime: metav1.Now(),
+		},
+		{
+			Type:               "Progressing",
+			Status:             conditionStatus(progressing),
+			Reason:             conditionReason(progressing, "NotProgressing", reason),
+			Message:            message,
+			ObservedGeneration: rc.Generation,
+			LastTransitionTime: metav1.Now(),
+		},
+		{
+			Type:               "Degraded",
+			Status:             conditionStatus(degraded),
+			Reason:             conditionReason(degraded, reason, "NotDegraded"),
+			Message:            message,
+			ObservedGeneration: rc.Generation,
+			LastTransitionTime: metav1.Now(),
+		},
+	}
+	for _, condition := range conditions {
+		apimeta.SetStatusCondition(&rc.Status.Conditions, condition)
+	}
+
+	return !reflect.DeepEqual(oldStatus, rc.Status)
+}
+
+func conditionStatus(active bool) metav1.ConditionStatus {
+	if active {
+		return metav1.ConditionTrue
+	}
+	return metav1.ConditionFalse
+}
+
+func conditionReason(active bool, activeReason, inactiveReason string) string {
+	if active {
+		return activeReason
+	}
+	return inactiveReason
+}
+
+func phaseConditionDetails(phase string) (reason, message string) {
+	switch phase {
+	case "Ready":
+		return "ClusterReady", "Redis cluster is healthy"
+	case "Provisioning":
+		return "ResourcesProvisioning", "Waiting for Redis pods to become ready"
+	case "Bootstrapping":
+		return "ClusterBootstrapping", "Forming the Redis cluster"
+	case "Degraded":
+		return "ClusterDegraded", "Redis cluster views are not yet consistent"
+	case "Failed":
+		return "InvalidConfiguration", "RedisCluster configuration is invalid"
+	case "UnsupportedChange":
+		return "TopologyChangeUnsupported", "A Redis topology or storage change requires a migration that is not implemented"
+	default:
+		return "Reconciling", "Reconciling Redis cluster"
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.

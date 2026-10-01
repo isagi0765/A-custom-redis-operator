@@ -1,8 +1,18 @@
 # redis-cluster-operator
-// TODO(user): Add simple overview of use/purpose
 
 ## Description
-// TODO(user): refer INFO.md for more details
+
+This Kubernetes operator manages Redis Cluster instances through the
+`RedisCluster` custom resource. It creates persistent Redis pods, bootstraps
+shards and replicas based on actual pod placement, monitors cluster health,
+and reconciles supported Service and pod-template changes.
+
+Automatic Redis resharding and StatefulSet storage-template migration are not
+implemented. Changes requiring those operations are reported as
+`UnsupportedChange` and are not applied. Redis authentication and TLS are also
+not configured by this operator yet, so restrict network access before using
+it outside an isolated development environment. See [INFO.md](INFO.md) for
+implementation details.
 
 ## Getting Started
 
@@ -132,4 +142,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

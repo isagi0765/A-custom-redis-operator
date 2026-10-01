@@ -74,10 +74,7 @@ type RedisClusterStatus struct {
 	// conditions represent the current state of the RedisCluster resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
+	// Condition types used by this controller are Ready, Progressing, and Degraded.
 	//
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
