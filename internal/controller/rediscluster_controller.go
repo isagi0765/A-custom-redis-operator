@@ -18,8 +18,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -49,6 +52,8 @@ type RedisClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+
+const redisClusterFinalizer = "cache.yourorg.io/pvc-cleanup"
 
 func labelsFor(name string) map[string]string {
 	return map[string]string{
@@ -193,6 +198,123 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 	}, nil
 }
 
+// unsupportedStatefulSetChange returns a human-readable reason when the
+// desired StatefulSet would require scale or PVC-template changes that this
+// operator does not implement (no reshard / volume migration yet). Other
+// pod-template drift is syncable and returns "".
+func unsupportedStatefulSetChange(existing, desired *appsv1.StatefulSet) string {
+	existingReplicas := int32(1)
+	if existing.Spec.Replicas != nil {
+		existingReplicas = *existing.Spec.Replicas
+	}
+	desiredReplicas := int32(1)
+	if desired.Spec.Replicas != nil {
+		desiredReplicas = *desired.Spec.Replicas
+	}
+	if existingReplicas != desiredReplicas {
+		return fmt.Sprintf(
+			"scaling StatefulSet replicas from %d to %d is not supported (no reshard path yet); recreate the RedisCluster or restore Spec.Nodes/ReplicasPerNode",
+			existingReplicas, desiredReplicas)
+	}
+	if pvcStorageChanged(existing.Spec.VolumeClaimTemplates, desired.Spec.VolumeClaimTemplates) {
+		return "changing storageSize/storageClassName after creation is not supported (PVC template is immutable); recreate the RedisCluster to change storage"
+	}
+	return ""
+}
+
+// pvcStorageChanged compares only the storage fields we own. Full
+// DeepEqual on VolumeClaimTemplates is too noisy -- the API server fills
+// defaults (volumeMode, etc.) on the live object that our desired builder
+// omits, which would falsely trip "unsupported change" every reconcile.
+func pvcStorageChanged(existing, desired []corev1.PersistentVolumeClaim) bool {
+	if len(existing) != len(desired) {
+		return true
+	}
+	for i := range desired {
+		eReq := existing[i].Spec.Resources.Requests[corev1.ResourceStorage]
+		dReq := desired[i].Spec.Resources.Requests[corev1.ResourceStorage]
+		if !eReq.Equal(dReq) {
+			return true
+		}
+		eSC, dSC := "", ""
+		if existing[i].Spec.StorageClassName != nil {
+			eSC = *existing[i].Spec.StorageClassName
+		}
+		if desired[i].Spec.StorageClassName != nil {
+			dSC = *desired[i].Spec.StorageClassName
+		}
+		if eSC != dSC {
+			return true
+		}
+	}
+	return false
+}
+
+// syncHeadlessService updates labels/selector/ports on an existing headless
+// Service when they drift from desired. ClusterIP is left alone (immutable).
+func syncHeadlessService(existing *corev1.Service, desired *corev1.Service) bool {
+	changed := false
+	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
+		existing.Labels = desired.Labels
+		changed = true
+	}
+	if !reflect.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		existing.Spec.Selector = desired.Spec.Selector
+		changed = true
+	}
+	if !reflect.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
+		existing.Spec.Ports = desired.Spec.Ports
+		changed = true
+	}
+	return changed
+}
+
+// syncStatefulSetTemplate copies mutable pod-template fields we own from
+// desired onto existing. Only compares explicit fields (image, resources,
+// command, topology spread) -- full Template DeepEqual fights API-server
+// defaulting and causes perpetual update loops.
+func syncStatefulSetTemplate(existing, desired *appsv1.StatefulSet) bool {
+	changed := false
+	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
+		existing.Labels = desired.Labels
+		changed = true
+	}
+	eC := redisContainer(&existing.Spec.Template.Spec)
+	dC := redisContainer(&desired.Spec.Template.Spec)
+	if eC != nil && dC != nil {
+		if eC.Image != dC.Image {
+			eC.Image = dC.Image
+			changed = true
+		}
+		if !reflect.DeepEqual(eC.Resources, dC.Resources) {
+			eC.Resources = dC.Resources
+			changed = true
+		}
+		if !reflect.DeepEqual(eC.Command, dC.Command) {
+			eC.Command = append([]string(nil), dC.Command...)
+			changed = true
+		}
+	}
+	if !reflect.DeepEqual(
+		existing.Spec.Template.Spec.TopologySpreadConstraints,
+		desired.Spec.Template.Spec.TopologySpreadConstraints,
+	) {
+		existing.Spec.Template.Spec.TopologySpreadConstraints =
+			desired.Spec.Template.Spec.TopologySpreadConstraints
+		changed = true
+	}
+	return changed
+}
+
+func redisContainer(spec *corev1.PodSpec) *corev1.Container {
+	for i := range spec.Containers {
+		if spec.Containers[i].Name == "redis" {
+			return &spec.Containers[i]
+		}
+	}
+	return nil
+}
+
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -203,36 +325,53 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("reconciling RedisCluster",
+	log.Info("Reconciling RedisCluster",
 		"name", redisCluster.Name,
 		"nodes", redisCluster.Spec.Nodes,
 		"replicasPerNode", redisCluster.Spec.ReplicasPerNode,
 	)
 
-	// 1. Headless Service -- create if missing. Not updating existing ones
-	// yet; that comes later once this basic create path is proven.
+	// Deletion: clean up PVCs owned by this cluster, then drop the finalizer.
+	// StatefulSet owner-refs do not delete volumeClaimTemplate PVCs by default.
+	if !redisCluster.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, &redisCluster)
+	}
+	if !containsString(redisCluster.Finalizers, redisClusterFinalizer) {
+		redisCluster.Finalizers = append(redisCluster.Finalizers, redisClusterFinalizer)
+		if err := r.Update(ctx, &redisCluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// 1. Headless Service -- create if missing, sync labels/ports if drifted.
 	svc := desiredHeadlessService(&redisCluster)
 	if err := ctrl.SetControllerReference(&redisCluster, svc, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 	var existingSvc corev1.Service
 	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &existingSvc); apierrors.IsNotFound(err) {
-		log.Info("creating headless service", "name", svc.Name)
+		log.Info("Creating headless Service", "name", svc.Name)
 		if err := r.Create(ctx, svc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("creating headless service: %w", err)
 		}
 	} else if err != nil {
 		return ctrl.Result{}, err
+	} else if syncHeadlessService(&existingSvc, svc) {
+		log.Info("Updating headless Service", "name", existingSvc.Name)
+		if err := r.Update(ctx, &existingSvc); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating headless service: %w", err)
+		}
 	}
 
-	// 2. StatefulSet -- create if missing.
+	// 2. StatefulSet -- create if missing; reject scale/storage changes;
+	// sync pod template (image/resources/flags) when safe.
 	sts, err := desiredStatefulSet(&redisCluster)
 	if err != nil {
 		// A bad spec (e.g. unparseable storageSize) isn't something
 		// retrying will fix -- surface it in status instead of
 		// requeuing forever.
-		redisCluster.Status.Phase = "Failed"
-		_ = r.Status().Update(ctx, &redisCluster)
+		_ = r.setPhase(ctx, &redisCluster, "Failed", 0, 0)
 		return ctrl.Result{}, err
 	}
 	if err := ctrl.SetControllerReference(&redisCluster, sts, r.Scheme); err != nil {
@@ -240,20 +379,38 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	var existingSts appsv1.StatefulSet
 	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), &existingSts); apierrors.IsNotFound(err) {
-		log.Info("creating statefulset", "name", sts.Name, "replicas", *sts.Spec.Replicas)
+		log.Info("Creating StatefulSet", "name", sts.Name, "replicas", *sts.Spec.Replicas)
 		if err := r.Create(ctx, sts); err != nil {
 			return ctrl.Result{}, fmt.Errorf("creating statefulset: %w", err)
 		}
 		existingSts = *sts
 	} else if err != nil {
 		return ctrl.Result{}, err
+	} else if reason := unsupportedStatefulSetChange(&existingSts, sts); reason != "" {
+		log.Info("Rejecting unsupported StatefulSet change", "reason", reason)
+		_ = r.setPhase(ctx, &redisCluster, "Failed", 0, 0)
+		// No requeue -- retrying will not make scale/storage supported.
+		return ctrl.Result{}, nil
+	} else if syncStatefulSetTemplate(&existingSts, sts) {
+		log.Info("Updating StatefulSet pod template", "name", existingSts.Name)
+		if err := r.Update(ctx, &existingSts); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating statefulset: %w", err)
+		}
+		// Rolling update in progress; wait for readiness on next pass.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.setPhase(ctx, &redisCluster, "Provisioning", 0, 0)
 	}
 
 	// 3. Nothing to do at the Redis level until every pod is actually
 	// running -- MEET against a pod that has no IP yet just fails.
-	if existingSts.Status.ReadyReplicas != *sts.Spec.Replicas {
-		log.Info("waiting for all pods to be ready",
-			"ready", existingSts.Status.ReadyReplicas, "desired", *sts.Spec.Replicas)
+	// Compare against the live STS replica count (scale is rejected above,
+	// so this matches the CR when the cluster is in a supported state).
+	desiredReady := int32(0)
+	if existingSts.Spec.Replicas != nil {
+		desiredReady = *existingSts.Spec.Replicas
+	}
+	if existingSts.Status.ReadyReplicas != desiredReady {
+		log.Info("Waiting for all pods to be ready",
+			"ready", existingSts.Status.ReadyReplicas, "desired", desiredReady)
 		return ctrl.Result{}, r.setPhase(ctx, &redisCluster, "Provisioning", 0, 0)
 	}
 
@@ -293,6 +450,12 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if needsBootstrap(ctx, nodes, numMasters) {
 		log.Info("Bootstrapping Redis cluster", "pods", len(nodes), "masters", numMasters)
 		if err := bootstrapCluster(ctx, nodes, numMasters); err != nil {
+			if errors.Is(err, ErrInsufficientNodes) {
+				log.Error(err, "Bootstrap blocked by cluster topology")
+				_ = r.setPhase(ctx, &redisCluster, "Failed", 0, 0)
+				// Requeue slowly: adding worker nodes can make this recoverable.
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			}
 			log.Error(err, "Bootstrap failed, will retry")
 			_ = r.setPhase(ctx, &redisCluster, "Bootstrapping", 0, 0)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -302,12 +465,17 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// 6. Cluster is formed. Cross-check EVERY pod's own view before
-	// trusting anything -- this replaces the old "stop at the first pod
-	// that answers without erroring" logic, which was the real bug: a
-	// pod could answer successfully while its own gossip was still
-	// incomplete after a restart, and the operator trusted it anyway,
-	// once reporting "healthy" with a whole master missing.
+	// 5b. Drop Redis gossip entries for pods that no longer exist. Ghosts
+	// inflate CLUSTER NODES line counts and trip fail flags permanently.
+	if purged, err := purgeGhostNodes(ctx, nodes); err != nil {
+		log.Error(err, "Ghost node purge failed")
+	} else if purged > 0 {
+		log.Info("Purged ghost Redis nodes", "count", purged)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// 6. Cluster is formed. Require every pod's view to pass completeness
+	// checks before trusting roles for status or rebalance.
 	assessment := assessHealth(ctx, nodes, len(nodes))
 	if !assessment.Complete {
 		log.Info("cluster view not yet consistent across all pods, will retry",
@@ -322,15 +490,16 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	parseClusterNodesText(assessment.RawNodes, byIP)
 
-	// Only ever act on a view we've confirmed every pod agrees with --
+	// Only ever act on a view every pod agrees is complete --
 	// rebalanceMasters must never fire against a partial/stale view,
 	// which could misdiagnose a real imbalance or miss one entirely.
 	if acted, rbErr := rebalanceMasters(ctx, nodes); rbErr != nil {
-		log.Error(rbErr, "master rebalance check failed")
-		// Don't fail the whole reconcile over this -- still report
-		// current (imperfect) status below, and try again next cycle.
+		log.Error(rbErr, "Master rebalance check failed")
+		// Unresolvable imbalance (or failover error) is not Ready.
+		_ = r.setPhase(ctx, &redisCluster, "Degraded", 0, 0)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	} else if acted {
-		log.Info("issued CLUSTER FAILOVER to correct a same-node master imbalance")
+		log.Info("Issued CLUSTER FAILOVER to correct a same-node master imbalance")
 		// Give the failover a moment to complete before re-observing.
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -374,6 +543,63 @@ func (r *RedisClusterReconciler) setPhase(
 	rc.Status.ReadyMasters = masters
 	rc.Status.ReadyReplicas = replicas
 	return r.Status().Update(ctx, rc)
+}
+
+func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, rc *cachev1.RedisCluster) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	if !containsString(rc.Finalizers, redisClusterFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	var pvcList corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcList, client.InNamespace(rc.Namespace)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing PVCs for cleanup: %w", err)
+	}
+	prefix := "data-" + rc.Name + "-"
+	outstanding := false
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if !strings.HasPrefix(pvc.Name, prefix) {
+			continue
+		}
+		if !pvc.DeletionTimestamp.IsZero() {
+			outstanding = true
+			continue
+		}
+		log.Info("Deleting PVC", "name", pvc.Name)
+		if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("deleting PVC %s: %w", pvc.Name, err)
+		}
+		outstanding = true
+	}
+	if outstanding {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	rc.Finalizers = removeString(rc.Finalizers, redisClusterFinalizer)
+	if err := r.Update(ctx, rc); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) []string {
+	out := slice[:0]
+	for _, item := range slice {
+		if item != s {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // SetupWithManager sets up the controller with the Manager.

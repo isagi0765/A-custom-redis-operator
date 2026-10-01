@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -31,6 +32,11 @@ const (
 	redisPort  = 6379
 	totalSlots = 16384
 )
+
+// ErrInsufficientNodes is returned by planRoles when pods span fewer
+// distinct Kubernetes nodes than Spec.Nodes masters require. Surfaced as
+// status Phase=Failed so the CR does not sit in Bootstrapping forever.
+var ErrInsufficientNodes = errors.New("insufficient Kubernetes nodes for master placement")
 
 // nodeInfo is one Redis node as the operator understands it: which pod it
 // is, which Kubernetes node it sits on, and (once the cluster knows about
@@ -167,13 +173,20 @@ func slotCountFromFields(fields []string) int {
 // which is exactly the false "healthy" this closes), and the master lines
 // it does know about collectively own all 16384 slots.
 func isClusterViewComplete(raw string, expectedNodes int) (ok bool, reason string) {
-	if strings.Contains(raw, "?") {
-		return false, "unresolved (?) peer address present"
-	}
-	if strings.Contains(raw, ",fail") {
-		return false, "a node is marked fail/fail?"
-	}
 	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		addr := strings.Split(fields[1], "@")[0]
+		if strings.HasPrefix(addr, "?") {
+			return false, "unresolved (?) peer address present"
+		}
+		if strings.Contains(fields[2], "fail") {
+			return false, "a node is marked fail/fail?"
+		}
+	}
 	if len(lines) != expectedNodes {
 		return false, fmt.Sprintf("knows %d nodes, expected %d", len(lines), expectedNodes)
 	}
@@ -199,26 +212,26 @@ type healthAssessment struct {
 	Issues     []string // human-readable reasons, one per pod that disagreed
 }
 
-// assessHealth is the comprehensive replacement for trusting the first pod
-// that happens to answer. It queries EVERY current pod and only reports
-// Complete=true once it finds one whose OWN view passes
-// isClusterViewComplete -- closing a real bug where the operator reported
-// "cluster healthy" with 2 of 3 masters visible, because it trusted
-// whichever pod's exec call happened to succeed first, even though that
-// pod's own gossip hadn't finished re-converging after a host reboot.
+// assessHealth queries EVERY current pod and only reports Complete=true
+// when every reachable pod's OWN view passes isClusterViewComplete.
+// Trusting the first complete view (the previous behaviour) could act on a
+// stale role map during failover while another pod still saw a different
+// topology. Unreachable pods keep Complete=false.
 //
 // expectedNodes is passed in (from len(nodes), which itself comes from
 // Spec.Nodes/ReplicasPerNode) rather than hardcoded, so this keeps working
 // correctly if the cluster is scaled to more shards or replicas later.
 //
-// If no pod has a fully complete view yet, Complete is false and RawNodes
-// holds the most-complete PARTIAL view available (by line count) purely so
-// callers can still log something useful -- callers MUST check Complete
-// before trusting the result for status="Ready" or for rebalanceMasters,
-// exactly the mistake that caused the original bug.
+// If the cluster is not yet fully consistent, Complete is false and
+// RawNodes holds the most-complete PARTIAL view available (by line count)
+// purely so callers can still log something useful -- callers MUST check
+// Complete before trusting the result for status="Ready" or for
+// rebalanceMasters.
 func assessHealth(ctx context.Context, nodes []nodeInfo, expectedNodes int) healthAssessment {
 	var a healthAssessment
 	bestRaw, bestPod, bestScore := "", "", -1
+	var firstComplete string
+	completeCount, reachable := 0, 0
 
 	for _, n := range nodes {
 		c := redisClient(n.IP)
@@ -228,49 +241,119 @@ func assessHealth(ctx context.Context, nodes []nodeInfo, expectedNodes int) heal
 			a.Issues = append(a.Issues, fmt.Sprintf("%s: unreachable", n.PodName))
 			continue
 		}
+		reachable++
 
-		if ok, _ := isClusterViewComplete(raw, expectedNodes); ok {
-			a.Complete = true
-			a.RawNodes = raw
-			a.QueriedPod = n.PodName
-			return a // first fully-agreeing view is enough to trust
+		if ok, reason := isClusterViewComplete(raw, expectedNodes); ok {
+			completeCount++
+			if firstComplete == "" {
+				firstComplete = raw
+				a.QueriedPod = n.PodName
+			}
+		} else {
+			a.Issues = append(a.Issues, fmt.Sprintf("%s: %s", n.PodName, reason))
 		}
-		_, reason := isClusterViewComplete(raw, expectedNodes)
-		a.Issues = append(a.Issues, fmt.Sprintf("%s: %s", n.PodName, reason))
 
 		if score := strings.Count(raw, "\n"); score > bestScore {
 			bestRaw, bestPod, bestScore = raw, n.PodName, score
 		}
 	}
 
+	if reachable == len(nodes) && completeCount == len(nodes) {
+		a.Complete = true
+		a.RawNodes = firstComplete
+		return a
+	}
+
 	a.RawNodes, a.QueriedPod = bestRaw, bestPod
+	if a.QueriedPod == "" {
+		a.QueriedPod = bestPod
+	}
 	return a // Complete stays false
 }
 
-// isBootstrapped answers a narrow, deliberately LOOSE question: has this
-// cluster EVER completed its one-time initial setup? It only gates
-// whether bootstrapCluster (MEET + ADDSLOTSRANGE + REPLICATE) should run.
+// isSlotMapComplete reports whether the full 16384-slot map is already
+// owned by the cluster. Unlike the old "any slots assigned" gate, a
+// PARTIAL assignment (e.g. master 1 succeeded, master 2 failed mid-
+// bootstrap) returns false so ensureClusterBootstrap can resume.
 //
-// This must NOT be the same check as "is the cluster currently fully
-// healthy" (that's assessHealth above, which is intentionally strict).
-// Conflating the two would be actively dangerous: if a momentarily
-// degraded cluster (e.g. right after a host reboot, before gossip has
-// re-converged) were mistaken for "never bootstrapped", the operator
-// would attempt to re-run CLUSTER ADDSLOTSRANGE against slots that are
-// already owned -- a destructive action, not a safe retry. So this stays
-// permissive: true the moment ANY reachable pod reports owning real
-// slots itself, regardless of whether every other pod currently agrees.
-func isBootstrapped(ctx context.Context, nodes []nodeInfo) bool {
+// A momentarily degraded-but-formed cluster still reports 16384 here, so
+// we do not re-enter slot assignment during gossip reconvergence.
+func isSlotMapComplete(ctx context.Context, nodes []nodeInfo) bool {
 	for _, n := range nodes {
 		assigned, err := clusterInfoField(ctx, n.IP, "cluster_slots_assigned")
 		if err != nil {
 			continue
 		}
-		if assigned != "" && assigned != "0" {
+		nSlots, err := strconv.Atoi(assigned)
+		if err != nil {
+			continue
+		}
+		if nSlots >= totalSlots {
 			return true
 		}
 	}
 	return false
+}
+
+// replicasAttached reports whether every non-slotted node is already a
+// replica of some slotted master. Used together with isSlotMapComplete to
+// decide whether ensureClusterBootstrap still has work to do (e.g. slots
+// were assigned but CLUSTER REPLICATE failed mid-loop).
+func replicasAttached(ctx context.Context, nodes []nodeInfo, numMasters int) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	byIP := map[string]*nodeInfo{}
+	for i := range nodes {
+		// Reset role fields so a stale in-memory view cannot falsely
+		// report attachment from a previous reconcile.
+		nodes[i].NodeID = ""
+		nodes[i].IsMaster = false
+		nodes[i].MasterID = ""
+		nodes[i].HasSlots = false
+		byIP[nodes[i].IP] = &nodes[i]
+	}
+	parsed := false
+	for _, n := range nodes {
+		if err := parseClusterNodes(ctx, n.IP, byIP); err == nil {
+			parsed = true
+			break
+		}
+	}
+	if !parsed {
+		return false
+	}
+	slottedMasters, replicaCount := 0, 0
+	for i := range nodes {
+		n := &nodes[i]
+		if n.NodeID == "" {
+			return false
+		}
+		if n.IsMaster && n.HasSlots {
+			slottedMasters++
+			continue
+		}
+		if !n.IsMaster && n.MasterID != "" && n.MasterID != "-" {
+			replicaCount++
+			continue
+		}
+		// Master without slots, or replica with no master id: bootstrap
+		// REPLICATE (or slot assign) still has work to do.
+		return false
+	}
+	return slottedMasters == numMasters && replicaCount == len(nodes)-numMasters
+}
+
+// needsBootstrap is true when initial formation is incomplete: either the
+// slot map is partial/empty, or expected replicas are not attached yet.
+// Deliberately NOT the same as assessHealth -- a fully formed cluster with
+// temporarily incomplete gossip still has a complete slot map and attached
+// replicas, so we will not re-enter bootstrap and risk BusyHashSlot chaos.
+func needsBootstrap(ctx context.Context, nodes []nodeInfo, numMasters int) bool {
+	if !isSlotMapComplete(ctx, nodes) {
+		return true
+	}
+	return !replicasAttached(ctx, nodes, numMasters)
 }
 
 // slotRanges splits the 16384 slots across numMasters, giving any remainder
@@ -327,8 +410,8 @@ func planRoles(nodes []nodeInfo, numMasters int) (masters []*nodeInfo, replicaOf
 
 	if len(k8sNodeNames) < numMasters {
 		return nil, nil, fmt.Errorf(
-			"need at least %d Kubernetes nodes to place one master each, but pods are spread over only %d (%v)",
-			numMasters, len(k8sNodeNames), k8sNodeNames)
+			"%w: need at least %d Kubernetes nodes to place one master each, but pods are spread over only %d (%v)",
+			ErrInsufficientNodes, numMasters, len(k8sNodeNames), k8sNodeNames)
 	}
 
 	// One master per Kubernetes node, for the first numMasters nodes.
@@ -371,8 +454,15 @@ func planRoles(nodes []nodeInfo, numMasters int) (masters []*nodeInfo, replicaOf
 	return masters, replicaOf, nil
 }
 
-// bootstrapCluster forms a brand-new cluster: introduce every node to every
-// other (MEET), assign slots to the chosen masters, then attach replicas.
+// bootstrapCluster forms or resumes a cluster: introduce every node
+// (MEET), assign any still-missing slot ranges to planned masters, then
+// attach replicas that are not yet replicating their planned master.
+//
+// Idempotent on purpose -- a partial failure mid-ADDSLOTSRANGE or mid-
+// REPLICATE used to leave isBootstrapped=true (any slots assigned) with
+// no recovery path. Re-entry is safe: already-owned ranges are skipped,
+// already-correct replicas are skipped, and slotted masters are never
+// demoted via REPLICATE.
 //
 // This is the Go equivalent of `redis-cli --cluster create`, which is not a
 // Redis command at all but a client-side helper that performs this same
@@ -386,7 +476,8 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 	}
 
 	// 1. MEET: introduce all nodes from the first one. Gossip spreads
-	// knowledge from there, so a single hub is enough.
+	// knowledge from there, so a single hub is enough. Re-MEET of an
+	// already-known peer is a no-op Redis accepts.
 	hub := redisClient(nodes[0].IP)
 	defer hub.Close()
 	for _, n := range nodes[1:] {
@@ -401,15 +492,33 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 		return err
 	}
 
-	// 3. Decide roles from real pod placement.
+	// 3. Decide roles from real pod placement. Deterministic for a given
+	// placement, so resume uses the same plan as the failed attempt.
 	masters, replicaOf, err := planRoles(nodes, numMasters)
 	if err != nil {
 		return err
 	}
 
-	// 4. Assign slots to masters.
+	byIP := map[string]*nodeInfo{}
+	for i := range nodes {
+		nodes[i].NodeID = ""
+		nodes[i].IsMaster = false
+		nodes[i].MasterID = ""
+		nodes[i].HasSlots = false
+		byIP[nodes[i].IP] = &nodes[i]
+	}
+	if err := parseClusterNodes(ctx, nodes[0].IP, byIP); err != nil {
+		return fmt.Errorf("reading CLUSTER NODES before slot assignment: %w", err)
+	}
+
+	// 4. Assign still-missing slot ranges. Skip a master that already owns
+	// its planned range so a resume after partial success does not hit
+	// BusyHashSlot on the masters that already finished.
 	ranges := slotRanges(numMasters)
 	for i, m := range masters {
+		if masterOwnsSlotRange(m, ranges[i][0], ranges[i][1]) {
+			continue
+		}
 		c := redisClient(m.IP)
 		err := c.ClusterAddSlotsRange(ctx, ranges[i][0], ranges[i][1]).Err()
 		c.Close()
@@ -419,11 +528,12 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 		}
 	}
 
-	// 5. Learn the node ids now that the cluster is formed, so replicas can
-	// be pointed at their master by id.
-	byIP := map[string]*nodeInfo{}
+	// 5. Re-learn node ids now that slots may have changed.
 	for i := range nodes {
-		byIP[nodes[i].IP] = &nodes[i]
+		nodes[i].NodeID = ""
+		nodes[i].IsMaster = false
+		nodes[i].MasterID = ""
+		nodes[i].HasSlots = false
 	}
 	if err := parseClusterNodes(ctx, nodes[0].IP, byIP); err != nil {
 		return fmt.Errorf("reading CLUSTER NODES after slot assignment: %w", err)
@@ -434,7 +544,8 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 		byPodName[nodes[i].PodName] = &nodes[i]
 	}
 
-	// 6. Attach each replica to its planned master.
+	// 6. Attach each planned replica. Skip if already correct; never
+	// REPLICATE a slotted master (that would demote an owning shard).
 	for replicaPod, masterPod := range replicaOf {
 		replica := byPodName[replicaPod]
 		master := byPodName[masterPod]
@@ -443,6 +554,12 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 		}
 		if master.NodeID == "" {
 			return fmt.Errorf("master %s has no known Redis node id yet", masterPod)
+		}
+		if replica.IsMaster && replica.HasSlots {
+			continue
+		}
+		if replica.MasterID == master.NodeID {
+			continue
 		}
 		c := redisClient(replica.IP)
 		err := c.ClusterReplicate(ctx, master.NodeID).Err()
@@ -453,6 +570,17 @@ func bootstrapCluster(ctx context.Context, nodes []nodeInfo, numMasters int) err
 	}
 
 	return nil
+}
+
+// masterOwnsSlotRange is a coarse resume helper: if the master already has
+// any slots and CLUSTER NODES marked HasSlots, we treat its planned range
+// as done. Exact per-slot verification would need the raw range text; for
+// the partial-bootstrap case (this master finished ADDSLOTSRANGE, the next
+// did not) HasSlots on the finished master is the signal we need.
+func masterOwnsSlotRange(m *nodeInfo, start, end int) bool {
+	_ = start
+	_ = end
+	return m != nil && m.IsMaster && m.HasSlots
 }
 
 // waitKnownNodes blocks until every node's gossip view contains the
@@ -588,4 +716,55 @@ func rebalanceMasters(ctx context.Context, nodes []nodeInfo) (acted bool, err er
 	return false, fmt.Errorf(
 		"master imbalance detected (overloaded=%v, underloaded=%v) but no safe single-step fix found this cycle",
 		overloaded, underloaded)
+}
+
+// purgeGhostNodes issues CLUSTER FORGET for Redis node IDs that appear in
+// CLUSTER NODES but do not belong to any current pod IP (leftovers from
+// replaced/deleted pods). Without this, line-count and fail-flag checks in
+// assessHealth can stay permanently Degraded after a disruptive pod replace.
+//
+// Returns how many distinct ghost IDs were forgotten (best-effort across
+// all live pods). Safe to call repeatedly -- FORGET of an unknown id is ignored.
+func purgeGhostNodes(ctx context.Context, nodes []nodeInfo) (int, error) {
+	knownIPs := map[string]struct{}{}
+	for _, n := range nodes {
+		knownIPs[n.IP] = struct{}{}
+	}
+
+	ghostIDs := map[string]struct{}{}
+	for _, n := range nodes {
+		c := redisClient(n.IP)
+		raw, err := c.ClusterNodes(ctx).Result()
+		c.Close()
+		if err != nil || raw == "" {
+			continue
+		}
+		for _, line := range strings.Split(raw, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			if strings.Contains(fields[2], "myself") {
+				continue
+			}
+			addr := strings.Split(fields[1], "@")[0]
+			ip := strings.Split(addr, ":")[0]
+			if _, ok := knownIPs[ip]; ok {
+				continue
+			}
+			ghostIDs[fields[0]] = struct{}{}
+		}
+	}
+	if len(ghostIDs) == 0 {
+		return 0, nil
+	}
+
+	for id := range ghostIDs {
+		for _, n := range nodes {
+			c := redisClient(n.IP)
+			_ = c.ClusterForget(ctx, id).Err()
+			c.Close()
+		}
+	}
+	return len(ghostIDs), nil
 }
