@@ -312,11 +312,55 @@ func syncHeadlessService(existing *corev1.Service, desired *corev1.Service) bool
 		existing.Spec.Selector = desired.Spec.Selector
 		changed = true
 	}
-	if !reflect.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
+	if !servicePortsEqual(existing.Spec.Ports, desired.Spec.Ports) {
 		existing.Spec.Ports = desired.Spec.Ports
 		changed = true
 	}
 	return changed
+}
+
+// servicePortsEqual compares the fields we own, treating an empty Protocol
+// as TCP (the API-server default) so omit-empty desired ports do not thrash.
+func servicePortsEqual(a, b []corev1.ServicePort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ap, bp := a[i], b[i]
+		aProto, bProto := ap.Protocol, bp.Protocol
+		if aProto == "" {
+			aProto = corev1.ProtocolTCP
+		}
+		if bProto == "" {
+			bProto = corev1.ProtocolTCP
+		}
+		if ap.Name != bp.Name || ap.Port != bp.Port || aProto != bProto {
+			return false
+		}
+		if !reflect.DeepEqual(ap.TargetPort, bp.TargetPort) {
+			return false
+		}
+	}
+	return true
+}
+
+// probesEqual compares probes after applying the API default for
+// SuccessThreshold (1). A zero value on either side must not look like drift.
+func probesEqual(a, b *corev1.Probe) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	ac, bc := a.DeepCopy(), b.DeepCopy()
+	if ac.SuccessThreshold == 0 {
+		ac.SuccessThreshold = 1
+	}
+	if bc.SuccessThreshold == 0 {
+		bc.SuccessThreshold = 1
+	}
+	return reflect.DeepEqual(ac, bc)
 }
 
 // syncStatefulSetTemplate copies mutable pod-template fields we own from
@@ -353,11 +397,11 @@ func syncStatefulSetTemplate(existing, desired *appsv1.StatefulSet) bool {
 			eC.SecurityContext = dC.SecurityContext.DeepCopy()
 			changed = true
 		}
-		if !reflect.DeepEqual(eC.ReadinessProbe, dC.ReadinessProbe) {
+		if !probesEqual(eC.ReadinessProbe, dC.ReadinessProbe) {
 			eC.ReadinessProbe = dC.ReadinessProbe.DeepCopy()
 			changed = true
 		}
-		if !reflect.DeepEqual(eC.LivenessProbe, dC.LivenessProbe) {
+		if !probesEqual(eC.LivenessProbe, dC.LivenessProbe) {
 			eC.LivenessProbe = dC.LivenessProbe.DeepCopy()
 			changed = true
 		}

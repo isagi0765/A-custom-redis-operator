@@ -3,7 +3,9 @@
 This document covers everything about the custom Kubernetes operator built in
 this project: how the project was scaffolded, what Kubebuilder generated on
 its own, every line of code added by hand, and exactly how the reconciliation
-logic works.
+logic works — including later hardening (resumable bootstrap, unanimous
+health checks, ghost purge, STS/Service sync, PVC finalizer, security
+contexts, and probes).
 
 ---
 
@@ -55,7 +57,8 @@ It produced four new files:
 | `api/v1/rediscluster_types.go` | The CRD's Go type definitions — started as a placeholder `Foo *string` field |
 | `api/v1/groupversion_info.go` | Boilerplate registering the `cache.yourorg.io/v1` API group with Kubernetes' scheme system — never touched by hand |
 | `internal/controller/rediscluster_controller.go` | The reconciler — started as an empty `Reconcile()` returning `nil` immediately |
-| `internal/controller/rediscluster_controller_test.go` + `suite_test.go` | Generated test scaffolding (Ginkgo/Gomega-based) — not used in this project |
+| `internal/controller/rediscluster_controller_test.go` + `suite_test.go` | Generated Ginkgo/Gomega scaffolding (envtest) |
+| `internal/controller/redis_logic_test.go` | Hand-written unit tests for slot math, `planRoles`, health parsing, and unsupported STS changes (no envtest) |
 
 ### 1.4 Turning Go types into a real CRD
 
@@ -213,34 +216,51 @@ explicit one.
 **`clusterInfoField` / `parseClusterNodes` / `parseClusterNodesText`** — parse
 Redis's plain-text `CLUSTER INFO` and `CLUSTER NODES` output into structured
 Go data. `parseClusterNodes` fetches and parses in one call;
-`parseClusterNodesText` (split out later — see §6) parses text a caller
-already has, avoiding a redundant round-trip. Both specifically **skip**
-any node ID whose IP doesn't match a currently-known pod — a deliberate
-guard against "ghost" entries (leftovers from deleted pods) corrupting the
-live view, a failure mode identified earlier while building the Python
-reconciler for the third-party operator.
+`parseClusterNodesText` parses text a caller already has, avoiding a
+redundant round-trip. Both specifically **skip** any node ID whose IP
+doesn't match a currently-known pod — a deliberate guard against "ghost"
+entries (leftovers from deleted pods) corrupting the live view. Ghosts
+that still appear in Redis gossip are cleaned separately by
+`purgeGhostNodes` (below).
 
-**`slotCountFromFields` / `isClusterViewComplete`** — added after a real
-bug (see §6): checks *one* pod's own `CLUSTER NODES` view against three
-conditions — no unresolved `?` addresses, nobody marked `fail`/`fail?`, and
-critically, that the pod knows about exactly as many peers as expected
-(not just "enough slots covered," which turned out to be an insufficient
-check on its own).
+**`slotCountFromFields` / `isClusterViewComplete`** — checks *one* pod's
+own `CLUSTER NODES` view: no unresolved `?` peer addresses, nobody marked
+`fail`/`fail?` (checked per-line on the flags field, not a naive
+substring over the whole blob), the pod knows about exactly
+`expectedNodes` peers, and masters collectively own all 16,384 slots.
 
-**`assessHealth`** — cross-checks *every* current pod's own view, not just
-whichever one answers first, and only reports `Complete: true` once one of
-them passes `isClusterViewComplete` in full. `expectedNodes` is passed in
-from the live pod count (derived from `Spec.Nodes`/`Spec.ReplicasPerNode`),
-not hardcoded, so this keeps working correctly as the cluster is scaled.
+**`assessHealth`** — queries *every* current pod and only reports
+`Complete: true` when **every reachable pod** passes
+`isClusterViewComplete` *and* every pod was reachable. Trusting the first
+complete view (the previous behaviour) could act on a stale role map
+during failover while another pod still saw a different topology.
+`expectedNodes` comes from the live pod count. When incomplete, `RawNodes`
+still holds the best partial view for logging — callers must check
+`Complete` before using it for status or rebalance.
 
-**`isBootstrapped`** — answers a narrow, deliberately *loose* question:
-has this cluster ever completed its one-time initial setup? True the
-moment *any* reachable pod reports owning real slots, with no requirement
-that every pod currently agrees. This is intentionally **not** the same
-check as `assessHealth`: conflating "fully healthy right now" with "was
-ever bootstrapped" would risk the operator re-running
-`CLUSTER ADDSLOTSRANGE` against already-owned slots during a momentary
-disagreement — a destructive action, not a safe retry.
+**`isSlotMapComplete` / `replicasAttached` / `needsBootstrap`** — replaced
+the old `isBootstrapped` gate. That older check returned true as soon as
+*any* slots were assigned, so a mid-bootstrap failure (master 1 got slots,
+master 2 did not; or slots assigned but `CLUSTER REPLICATE` failed) left
+the cluster stuck with no recovery path. The new gate:
+
+- `isSlotMapComplete` — true only when some pod reports
+  `cluster_slots_assigned >= 16384` (partial maps stay false so bootstrap
+  can resume)
+- `replicasAttached` — true only when every expected replica already
+  points at a slotted master (and every node has a known Redis ID)
+- `needsBootstrap` — true when either check fails
+
+This is still deliberately **not** the same as `assessHealth`: a fully
+formed cluster with temporarily incomplete gossip still has a complete
+slot map and attached replicas, so the operator will not re-enter
+bootstrap and risk `BusyHashSlot` chaos.
+
+**`ErrInsufficientNodes`** — sentinel returned by `planRoles` (and checked
+with `errors.Is` in the controller) when pods span fewer distinct
+Kubernetes nodes than `Spec.Nodes` masters require. Surfaced as
+`status.phase = "Failed"` with a slow 60s requeue so adding workers can
+recover the CR instead of leaving it forever in `Bootstrapping`.
 
 **`slotRanges(numMasters)`** — splits the 16,384 hash slots evenly across
 masters, giving any remainder to the last one.
@@ -252,20 +272,26 @@ already sits on a distinct node, a rotation by exactly one guarantees no
 replica ever lands on its own master's node — a mathematical guarantee, not
 a scheduling hint.
 
-**`bootstrapCluster`** — the Go equivalent of `redis-cli --cluster create`
-(which is not a real Redis command, but a client-side helper performing
-this same sequence): `CLUSTER MEET` every pod to the first one, wait for
-full gossip convergence (`waitKnownNodes`), call `planRoles`, assign slot
-ranges via `CLUSTER ADDSLOTSRANGE`, re-read node IDs, then issue
-`CLUSTER REPLICATE` for every planned pairing.
+**`bootstrapCluster`** — forms *or resumes* a cluster. Idempotent on
+purpose: `CLUSTER MEET` (already-known peers are a no-op),
+`waitKnownNodes`, `planRoles` (deterministic for a given placement), then
+assign only still-missing slot ranges (`masterOwnsSlotRange` skips masters
+that already own slots), re-read node IDs, and `CLUSTER REPLICATE` only
+for replicas that are not already correct — never demoting a slotted
+master. This is the Go equivalent of `redis-cli --cluster create`, done
+ourselves so we choose the pairing deliberately.
 
-**`rebalanceMasters`** — added *after* the first successful failover test
-revealed a real gap: `planRoles` only ever runs once, at bootstrap. A later
-promotion can leave two masters on one physical node with nothing
-correcting it. This function detects that condition (a K8s node with 2+
-masters *and* another node with 0) and issues `CLUSTER FAILOVER` on a
-correctly-placed replica to fix it — mirroring the `REBALANCE_MASTER` logic
-originally built in Python for the third-party operator.
+**`purgeGhostNodes`** — issues `CLUSTER FORGET` for Redis node IDs that
+appear in gossip but do not belong to any current pod IP. Without this,
+line-count and fail-flag checks in `assessHealth` can stay permanently
+`Degraded` after a disruptive pod replace. Safe to call repeatedly.
+
+**`rebalanceMasters`** — ongoing counterpart to `planRoles`. A later
+promotion can leave two masters on one physical node; this detects that
+condition (a K8s node with 2+ masters *and* another node with 0) and
+issues `CLUSTER FAILOVER` on a correctly-placed replica — mirroring the
+`REBALANCE_MASTER` logic originally built in Python. Unresolvable
+imbalance is an error (not silently ignored).
 
 ### 3.3 `internal/controller/rediscluster_controller.go`
 
@@ -277,6 +303,7 @@ Everything below was added.
 controller actually touches:
 
 ```go
+// +kubebuilder:rbac:groups=cache.yourorg.io,resources=redisclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
@@ -284,39 +311,72 @@ controller actually touches:
 ```
 
 Without these, `make manifests` would never generate the RBAC rules the
-operator needs, and every StatefulSet/Service creation attempt would fail
-with a permissions error at runtime.
+operator needs, and every StatefulSet/Service/PVC attempt would fail with
+a permissions error at runtime.
+
+**Finalizer** — `cache.yourorg.io/pvc-cleanup`. StatefulSet owner-refs do
+**not** delete `volumeClaimTemplate` PVCs by default; without this, deleting
+a `RedisCluster` leaves orphaned data volumes. On create, the finalizer is
+added immediately. On delete, `reconcileDelete` lists PVCs named
+`data-<cr-name>-*`, deletes them, waits until they are gone, then removes
+the finalizer.
 
 **`labelsFor(name)`** — one shared label set (`app: redis-cluster`,
 `redis-cluster.cache.yourorg.io/name: <cr-name>`) used consistently across
 the Service, StatefulSet, and every pod selector.
 
 **`desiredHeadlessService`** — builds the governing headless
-(`ClusterIP: None`) Service every StatefulSet requires for stable pod DNS.
+(`ClusterIP: None`) Service every StatefulSet requires for stable pod DNS
+(ports `6379` redis + `16379` gossip).
+
+**`syncHeadlessService`** — when the Service already exists, updates
+labels/selector/ports if they drifted. `ClusterIP` is left alone
+(immutable). Closes the earlier "create-only, never fix drift" limitation.
 
 **`desiredStatefulSet`** — the other core piece of infrastructure logic:
 
 - `totalReplicas := rc.Spec.Nodes * (1 + rc.Spec.ReplicasPerNode)` — uniform
   pods, no static leader/follower split
+- **Pod + container security contexts** — non-root (`runAsUser: 999` /
+  `runAsGroup`/`fsGroup: 1000`), `RuntimeDefault` seccomp, drop all
+  capabilities, no privilege escalation
+- **Readiness / liveness probes** — TCP on `6379` so Kubernetes readiness
+  (and therefore the "all pods Ready" reconcile gate) reflects a listening
+  Redis, not just a started container
 - A single **hard** `TopologySpreadConstraint` (`maxSkew: 1`,
   `DoNotSchedule`) for even distribution. Safe as a hard constraint here
   specifically because nothing else competes with it — the pairing decision
   happens later, in Go, not as a second scheduling rule.
-- `NodeTaintsPolicy: Honor` — added after a real bug: without it, the
-  tainted (unschedulable) control-plane node still counted as a valid
-  "empty" domain in the scheduler's skew math, blocking the 4th pod from
-  ever scheduling even though 2-per-node across the real worker nodes was
-  well within `maxSkew: 1`.
-- `--cluster-announce-ip $(POD_IP)` baked into the container command from
-  the start, fed by a `POD_IP` env var sourced from the Downward API
-  (`status.podIP`) — this exact omission caused a stale-gossip bug
-  (`?:6379`) twice earlier in this project on the hand-built cluster.
+- `NodeTaintsPolicy: Honor` — without it, the tainted control-plane node
+  still counted as a valid "empty" domain in skew math, blocking the 4th
+  pod (see §6)
+- `--cluster-announce-ip $(POD_IP)` from the Downward API — omission caused
+  the stale-gossip `?:6379` bug earlier in this project
+
+**`unsupportedStatefulSetChange` / `pvcStorageChanged`** — rejects
+in-place scale (`Spec.Nodes` / `ReplicasPerNode` changing replica count)
+and storage-template changes (`storageSize` / `storageClassName`). There
+is no reshard or volume-migration path yet; those CRs get
+`status.phase = "Failed"` with no busy-loop requeue. PVC comparison is
+scoped to storage fields only — full DeepEqual fights API-server
+defaulting (`volumeMode`, etc.) and would falsely trip every cycle.
+
+**`syncStatefulSetTemplate`** — when scale/storage are unchanged, syncs
+mutable pod-template fields the operator owns: labels, pod/container
+security contexts, image, resources, command, readiness/liveness probes,
+and topology spread constraints. Uses targeted field compares +
+`DeepCopy` for pointer-bearing structs (not full Template DeepEqual) to
+avoid perpetual update loops from API defaults. After a template update,
+phase is set to `Provisioning` and requeued while the rolling update
+settles.
 
 **`Reconcile()`** — see §4 for the full walkthrough.
 
 **`setPhase`** — writes `.status` only when something actually changed, to
 avoid a reconcile loop that continuously triggers itself via its own status
-writes.
+writes. Phases in use: `Provisioning`, `Bootstrapping`, `Ready`,
+`Degraded` (gossip inconsistent or unresolvable master imbalance),
+`Failed` (bad spec, unsupported scale/storage, or insufficient K8s nodes).
 
 **`SetupWithManager`** — registers three watches:
 
@@ -345,67 +405,78 @@ times in quick succession.
 1. **Fetch the `RedisCluster` object.** If it's gone (`NotFound`), return
    cleanly — nothing to do.
 
-2. **Ensure the headless Service exists.** Create it if missing; not yet
-   updated if it drifts from spec (a known, accepted limitation).
+2. **Deletion path.** If `DeletionTimestamp` is set, run `reconcileDelete`
+   (delete `data-<name>-*` PVCs, wait, remove finalizer) and return.
+   Otherwise ensure the `cache.yourorg.io/pvc-cleanup` finalizer is present
+   (add + requeue if missing).
 
-3. **Ensure the StatefulSet exists**, built from the current spec via
+3. **Ensure the headless Service.** Create if missing; if present, run
+   `syncHeadlessService` to fix label/selector/port drift.
+
+4. **Ensure the StatefulSet**, built from the current spec via
    `desiredStatefulSet`. `ctrl.SetControllerReference` is set on both the
-   Service and StatefulSet — this is what makes Kubernetes automatically
-   garbage-collect them when the `RedisCluster` CR is deleted, and what
-   powers the `Owns()` watches.
+   Service and StatefulSet — owner-ref GC for those objects, and what powers
+   the `Owns()` watches.
+   - Bad `storageSize` → `Failed`, return error (not a retryable loop)
+   - Unsupported scale / PVC-template change → `Failed`, no requeue
+   - Syncable template drift → `syncStatefulSetTemplate`, then
+     `Provisioning` + requeue 5s while the rolling update runs
 
-4. **Gate: are all desired pods `Ready`?** If not, set `status.phase =
-   "Provisioning"` and return — nothing at the Redis level is attempted
-   until every pod actually has a running container.
+5. **Gate: are all desired pods `Ready`?** Compare live STS
+   `ReadyReplicas` to the live STS replica count. If not ready, set
+   `Provisioning` and return — nothing at the Redis level is attempted
+   until every pod is ready (probes now require Redis listening on 6379).
 
-5. **List real pods and build `nodeInfo` entries** with `PodName`,
+6. **List real pods and build `nodeInfo` entries** with `PodName`,
    `K8sNode` (from `pod.Spec.NodeName`), and `IP` (from
-   `pod.Status.PodIP`). If any pod lacks an IP or node assignment yet,
-   requeue after 5 seconds rather than act on incomplete data.
+   `pod.Status.PodIP`). Sort by pod name for deterministic behaviour. If
+   any pod lacks an IP or node assignment yet, requeue after 5 seconds.
 
-6. **Gate: is the cluster already bootstrapped?** (`isBootstrapped`, §3.2).
-   - If **not**: run `bootstrapCluster` (MEET → plan roles → assign slots
-     → attach replicas). On success, requeue after 5 seconds to let gossip
-     settle before reporting status. On failure, set `status.phase =
-     "Bootstrapping"` and retry in 10 seconds.
-   - If **already bootstrapped**: bootstrap logic is never re-run —
-     idempotency guard.
+7. **Gate: does formation still need work?** (`needsBootstrap`, §3.2).
+   - If **yes**: run idempotent `bootstrapCluster` (MEET → plan roles →
+     assign missing slots → attach missing replicas). On success, requeue
+     5s for gossip. On `ErrInsufficientNodes`, set `Failed` and requeue
+     60s. On other errors, set `Bootstrapping` and retry in 10s.
+   - If **no**: bootstrap is skipped — slot map complete *and* replicas
+     attached.
 
-7. **Populate real Redis role data into the same `nodes` slice** via
-   `parseClusterNodes`, querying pods until one answers successfully. (This
-   step was the subject of a real bug fixed mid-project — see §6.)
+8. **Purge ghost Redis nodes** via `purgeGhostNodes`. If any were
+   forgotten, requeue 5s before trusting gossip counts.
 
-8. **Run `rebalanceMasters`.** If it finds and fixes a same-node master
-   imbalance, requeue after 5 seconds to let the failover settle before the
-   next pass. If it finds an imbalance with no safe single-step fix, log
-   the error but continue — still report best-effort status rather than
-   fail the whole reconcile.
+9. **Assess cluster health** with `assessHealth`. If not every pod agrees
+   on a complete view, set `Degraded` and requeue 5s — do **not** rebalance
+   or report Ready on a partial/stale map.
 
-9. **Compute `mastersReady`/`replicasReady`** directly from the already-
-   fetched `nodes` data (no redundant second Redis query) and write
-   `status.phase = "Ready"` via `setPhase`.
+10. **Populate roles** from the agreed `assessment.RawNodes` via
+    `parseClusterNodesText` (no extra Redis round-trip).
 
-10. **Always requeue after 30 seconds**, even when nothing changed. This is
-    not optional: Kubernetes has no watch mechanism for changes happening
-    *inside* Redis (a promotion, a role flip) — without this periodic
-    heartbeat, step 8's imbalance check would only ever fire right after a
-    pod-recreation event and could silently miss drift that no Kubernetes
-    event ever announces.
+11. **Run `rebalanceMasters`.** If it issues a corrective failover,
+    requeue 5s. If imbalance is unresolvable (or failover errors), set
+    `Degraded` and requeue 10s — no longer "log and pretend Ready."
+
+12. **Compute `mastersReady`/`replicasReady`** from the already-fetched
+    `nodes` data and write `status.phase = "Ready"` via `setPhase`.
+
+13. **Always requeue after 30 seconds**, even when nothing changed.
+    Kubernetes has no watch for changes *inside* Redis (a promotion, a
+    role flip) — without this heartbeat, rebalance would only fire after
+    a K8s event and could miss silent drift.
 
 ---
 
 ## 5. What actually triggers a reconcile
 
-Four distinct triggers, from `SetupWithManager`:
+Four distinct triggers, from `SetupWithManager`, plus the deletion path:
 
-1. Any change to the `RedisCluster` object itself
+1. Any change to the `RedisCluster` object itself (including finalizer /
+   deletion timestamp)
 2. Any change to the StatefulSet it owns (pod count, readiness, spec)
 3. Any change to the Service it owns
-4. The flat 30-second periodic requeue from step 10 above
+4. The flat 30-second periodic requeue from step 13 above
 
-Even when triggered, `Reconcile()` only reaches the `rebalanceMasters` check
-if every gate before it (pods ready, cluster bootstrapped, role data
-successfully read) already passed.
+Even when triggered, `Reconcile()` only reaches `rebalanceMasters` if
+every gate before it (pods ready, bootstrap complete, ghosts purged,
+`assessHealth.Complete`) already passed.
 
 ---
 
@@ -417,14 +488,36 @@ hypotheticals:
 | Bug | Symptom | Fix |
 |---|---|---|
 | Missing `NodeTaintsPolicy` | 4th pod stuck `Pending`, "didn't match pod topology spread constraints" on all 3 real worker nodes | Added `NodeTaintsPolicy: Honor` so the tainted control-plane node is excluded from skew math |
-| `rebalanceMasters` operating on blank data | Real 2-masters-on-one-node imbalance never detected or fixed across many reconcile cycles, no error logged | `rebalanceMasters` was being called on the bare pod-list version of `nodes` (only `PodName`/`K8sNode`/`IP` set) *before* `parseClusterNodes` had ever populated `IsMaster`/`HasSlots`/`NodeID` into that same slice — every `IsMaster` was `false` by Go's zero-value default. Fixed by populating role data in-place before calling the rebalance check. |
-| Leader election timeout | Operator pod stuck retrying `"context deadline exceeded"` against the API server, never started reconciling | Not a code bug — `kube-proxy` was crash-looping cluster-wide from `too many open files`; the host's inotify limits had reverted to OS defaults because an earlier `sudo sysctl` fix was never persisted to `/etc/sysctl.conf`. Fixed by writing the limits permanently and recreating the kind cluster. |
-| Accidentally deleted function header | `apply_fix is not defined` (this one was in the Python reconciler, not Go) | A `str_replace` edit matched text spanning a function boundary and silently dropped the `def apply_fix(...):` line itself, turning its body into dead code nested inside the previous function. Fixed by restoring the header line. |
-| Health check trusted the first pod, not all pods | After a host reboot with 6 pods restarting at different times, the operator reported `"cluster healthy" masters: 2, replicas: 3` — a real master entirely missing from status, with no action taken | The role-population step queried pods in order and stopped at the first one that answered *without erroring* — it never checked whether that pod's own gossip view was actually complete. One pod hadn't finished re-converging and only knew about 5 of 6 real nodes; the operator trusted it anyway. Fixed by replacing the "first responder wins" logic with `assessHealth`, which cross-checks every pod and only trusts a view that passes a full completeness check (right node count, right slot count, no fail flags). `isBootstrapped` was deliberately kept loose rather than also tightened, to avoid a worse failure mode — see §3.2. |
+| `rebalanceMasters` operating on blank data | Real 2-masters-on-one-node imbalance never detected or fixed across many reconcile cycles, no error logged | Role data was missing from `nodes` before rebalance. Fixed by populating roles (now from a complete `assessHealth` view) before calling rebalance |
+| Leader election timeout | Operator pod stuck retrying `"context deadline exceeded"` against the API server, never started reconciling | Not a code bug — `kube-proxy` crash-looping from `too many open files`; inotify limits had reverted. Persisted sysctls and recreated the kind cluster |
+| Accidentally deleted function header | `apply_fix is not defined` (Python reconciler, not Go) | A `str_replace` spanned a function boundary and dropped `def apply_fix(...):`. Restored the header |
+| Health check trusted the first answering pod | After reboot, status showed `"cluster healthy" masters: 2, replicas: 3` — a real master missing | Replaced "first responder wins" with `assessHealth` completeness checks |
+| Health check trusted the *first complete* view | During failover, one pod's complete-looking map could still disagree with peers; operator acted on it | Tightened `assessHealth` so `Complete` requires **every** pod reachable *and* complete |
+| Partial bootstrap left cluster stuck | Mid-`ADDSLOTSRANGE` / mid-`REPLICATE` failure set old `isBootstrapped=true` (any slots assigned) with no resume path | Replaced with `needsBootstrap` + idempotent `bootstrapCluster` that skips already-owned ranges and already-correct replicas |
+| Ghost Redis nodes after pod replace | `assessHealth` stayed `Degraded` forever (extra `CLUSTER NODES` lines / fail flags for dead IPs) | Added `purgeGhostNodes` (`CLUSTER FORGET`) before health assessment |
+| Service / STS create-only | Spec changes (image, resources, ports) never applied after first create | Added `syncHeadlessService` and `syncStatefulSetTemplate`; reject unsupported scale/storage explicitly as `Failed` |
+| Orphaned PVCs on CR delete | Deleting a `RedisCluster` left `data-<name>-*` volumes behind | Finalizer `cache.yourorg.io/pvc-cleanup` + `reconcileDelete` |
+| Naive `fail` / `?` substring checks | False positives on hostnames or unrelated text inside `CLUSTER NODES` blobs | Per-line parse of address and flags fields in `isClusterViewComplete` |
 
 ---
 
-## 7. Summary: why this succeeded where three pre-built operators didn't
+## 7. Unit tests added by hand
+
+`internal/controller/redis_logic_test.go` covers pure logic without a
+live Redis or envtest:
+
+| Test | What it locks in |
+|---|---|
+| `TestSlotRanges` | Full 0–16383 coverage, correct 3-master splits |
+| `TestPlanRolesAntiAffinity` | No replica shares a K8s node with its master |
+| `TestPlanRolesInsufficientNodes` | Returns `ErrInsufficientNodes` when placement is impossible |
+| `TestIsClusterViewComplete` | `?` / `fail` / wrong peer count / incomplete slots rejected |
+| `TestParseClusterNodesText` | Role fields filled from raw gossip text |
+| `TestUnsupportedStatefulSetChange` | Same STS ok; scale and storage changes rejected |
+
+---
+
+## 8. Summary: why this succeeded where three pre-built operators didn't
 
 The single architectural decision this all rests on: **Kubernetes decides
 placement, Go code decides pairing, and they never negotiate with each
@@ -436,3 +529,8 @@ silently did nothing (soft rules, since Kubernetes has no concept of
 pods already exist and with full visibility into where they landed, sidesteps
 that entire class of problem — and, as §6 shows, still required real,
 hands-on debugging to get right the first time.
+
+Later hardening (resumable bootstrap, unanimous gossip before Ready,
+ghost purge, STS/Service sync, PVC finalizer, security contexts and
+probes) does not change that core split — it makes the operator safe to
+re-enter after partial failure and honest about degraded state.
