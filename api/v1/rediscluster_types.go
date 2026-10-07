@@ -52,6 +52,13 @@ type RedisClusterSpec struct {
 	// storageClassName is the StorageClass used for each node's PVC.
 	// +optional
 	StorageClassName string `json:"storageClassName,omitempty"`
+
+	// passwordSecretRef references a Secret key holding the Redis password.
+	// When set, Redis runs with requirepass/masterauth and protected-mode yes,
+	// and the operator authenticates for all CLUSTER commands.
+	// When unset, Redis stays open (dev/PoC only — combine with NetworkPolicy).
+	// +optional
+	PasswordSecretRef *corev1.SecretKeySelector `json:"passwordSecretRef,omitempty"`
 }
 
 // RedisClusterStatus defines the observed state of RedisCluster.

@@ -173,6 +173,75 @@ func TestSyncHeadlessServicePreservesAllocatedFields(t *testing.T) {
 	}
 }
 
+func TestDesiredStatefulSetEnablesAuthAndHardening(t *testing.T) {
+	rc := &cachev1.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"},
+		Spec: cachev1.RedisClusterSpec{
+			Nodes:           3,
+			ReplicasPerNode: 1,
+			Image:           "redis:7.2-alpine",
+			StorageSize:     "1Gi",
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"},
+				Key:                  "password",
+			},
+		},
+	}
+	sts, err := desiredStatefulSet(rc)
+	if err != nil {
+		t.Fatalf("desiredStatefulSet: %v", err)
+	}
+	c := sts.Spec.Template.Spec.Containers[0]
+	joined := strings.Join(c.Command, " ")
+	for _, want := range []string{"--requirepass $(REDIS_PASSWORD)", "--masterauth $(REDIS_PASSWORD)", "--protected-mode yes"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("command missing %q: %v", want, c.Command)
+		}
+	}
+	foundPasswordEnv := false
+	for _, env := range c.Env {
+		if env.Name == "REDIS_PASSWORD" && env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			foundPasswordEnv = true
+		}
+	}
+	if !foundPasswordEnv {
+		t.Fatal("expected REDIS_PASSWORD env from Secret")
+	}
+	if sts.Spec.Template.Spec.SecurityContext == nil || sts.Spec.Template.Spec.SecurityContext.RunAsNonRoot == nil || !*sts.Spec.Template.Spec.SecurityContext.RunAsNonRoot {
+		t.Fatal("expected pod runAsNonRoot")
+	}
+	if c.SecurityContext == nil || c.SecurityContext.AllowPrivilegeEscalation == nil || *c.SecurityContext.AllowPrivilegeEscalation {
+		t.Fatal("expected allowPrivilegeEscalation=false")
+	}
+}
+
+func TestDesiredNetworkPolicyLimitsRedisPorts(t *testing.T) {
+	rc := &cachev1.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"}}
+	np := desiredNetworkPolicy(rc)
+	if len(np.Spec.Ingress) != 1 || len(np.Spec.Ingress[0].Ports) != 2 {
+		t.Fatalf("unexpected ingress ports: %+v", np.Spec.Ingress)
+	}
+	if len(np.Spec.Egress) < 2 {
+		t.Fatalf("expected peer + DNS egress rules, got %d", len(np.Spec.Egress))
+	}
+	existing := np.DeepCopy()
+	if syncNetworkPolicy(existing, np) {
+		t.Fatal("identical NetworkPolicy sync reported changes")
+	}
+	existing.Spec.Ingress[0].Ports = existing.Spec.Ingress[0].Ports[:1]
+	if !syncNetworkPolicy(existing, np) {
+		t.Fatal("expected NetworkPolicy drift to sync")
+	}
+}
+
+func TestRedisClientCarriesPassword(t *testing.T) {
+	c := redisClient("10.0.0.1", "s3cret")
+	defer c.Close()
+	if c.Options().Password != "s3cret" {
+		t.Fatalf("Password = %q, want s3cret", c.Options().Password)
+	}
+}
+
 func TestStatefulSetReconciliationPreservesTopologyAndDetectsUnsupportedChanges(t *testing.T) {
 	replicas := int32(6)
 	existing := &appsv1.StatefulSet{

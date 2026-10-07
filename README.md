@@ -9,9 +9,13 @@ and reconciles supported Service and pod-template changes.
 
 Automatic Redis resharding and StatefulSet storage-template migration are not
 implemented. Changes requiring those operations are reported as
-`UnsupportedChange` and are not applied. Redis authentication and TLS are also
-not configured by this operator yet, so restrict network access before using
-it outside an isolated development environment. See [INFO.md](INFO.md) for
+`UnsupportedChange` and are not applied.
+
+**PoC security:** set `spec.passwordSecretRef` to enable Redis
+`requirepass`/`masterauth` (see `config/samples/`). The operator also creates a
+`NetworkPolicy` for ports 6379/16379 and runs Redis as non-root. TLS is still
+not configured. See [OPERATOR_CHANGES.md](OPERATOR_CHANGES.md) for the full
+list of upgrades vs the original operator, and [INFO.md](INFO.md) for
 implementation details.
 
 ## Getting Started

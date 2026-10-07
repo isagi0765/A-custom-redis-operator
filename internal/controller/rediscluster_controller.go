@@ -26,6 +26,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -52,6 +53,8 @@ type RedisClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 func labelsFor(name string) map[string]string {
 	return map[string]string{
@@ -149,6 +152,102 @@ func syncStatefulSetTemplate(existing, desired *appsv1.StatefulSet) bool {
 	return changed
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func int64Ptr(v int64) *int64 { return &v }
+
+// redisPodSecurityContext hardens Redis pods for PoC use: non-root, no
+// privilege escalation, all capabilities dropped.
+func redisPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: boolPtr(true),
+		RunAsUser:    int64Ptr(999),
+		FSGroup:      int64Ptr(999),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+func redisContainerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: boolPtr(false),
+		RunAsNonRoot:             boolPtr(true),
+		RunAsUser:                int64Ptr(999),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
+}
+
+// desiredNetworkPolicy restricts Redis data/gossip ports to peer pods in
+// the same cluster and to the operator control-plane pods.
+func desiredNetworkPolicy(rc *cachev1.RedisCluster) *networkingv1.NetworkPolicy {
+	labels := labelsFor(rc.Name)
+	tcp := corev1.ProtocolTCP
+	udp := corev1.ProtocolUDP
+	redisPort := intstr.FromInt32(6379)
+	gossipPort := intstr.FromInt32(16379)
+	dnsPort := intstr.FromInt32(53)
+
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rc.Name,
+			Namespace: rc.Namespace,
+			Labels:    labels,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: labels},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{
+					{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"control-plane": "controller-manager",
+					}}},
+				},
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &tcp, Port: &redisPort},
+					{Protocol: &tcp, Port: &gossipPort},
+				},
+			}},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &tcp, Port: &redisPort},
+						{Protocol: &tcp, Port: &gossipPort},
+					},
+				},
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{NamespaceSelector: &metav1.LabelSelector{}},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &udp, Port: &dnsPort},
+						{Protocol: &tcp, Port: &dnsPort},
+					},
+				},
+			},
+		},
+	}
+}
+
+func syncNetworkPolicy(existing, desired *networkingv1.NetworkPolicy) bool {
+	changed := !reflect.DeepEqual(existing.Labels, desired.Labels) ||
+		!reflect.DeepEqual(existing.Spec, desired.Spec)
+	if changed {
+		existing.Labels = desired.Labels
+		existing.Spec = desired.Spec
+	}
+	return changed
+}
+
 // desiredStatefulSet builds the StatefulSet running all nodes as uniform
 // pods -- no static leader/follower identity. Role assignment happens
 // later, in our own Go code, once we can see actual pod placement --
@@ -177,6 +276,47 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 		pvcTemplate.Spec.StorageClassName = &rc.Spec.StorageClassName
 	}
 
+	env := []corev1.EnvVar{
+		{
+			Name: "POD_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
+			},
+		},
+	}
+	command := []string{
+		"redis-server",
+		"--port", "6379",
+		"--cluster-enabled", "yes",
+		"--cluster-config-file", "/data/nodes.conf",
+		"--cluster-node-timeout", "5000",
+		"--appendonly", "yes",
+		"--bind", "0.0.0.0",
+		// baked in from day one -- this exact
+		// omission caused the stale-gossip
+		// "?:6379" bug we hit twice with the
+		// hand-built cluster.
+		"--cluster-announce-ip", "$(POD_IP)",
+	}
+	if ref := rc.Spec.PasswordSecretRef; ref != nil && ref.Name != "" && ref.Key != "" {
+		env = append(env, corev1.EnvVar{
+			Name: "REDIS_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+					Key:                  ref.Key,
+				},
+			},
+		})
+		command = append(command,
+			"--requirepass", "$(REDIS_PASSWORD)",
+			"--masterauth", "$(REDIS_PASSWORD)",
+			"--protected-mode", "yes",
+		)
+	} else {
+		command = append(command, "--protected-mode", "no")
+	}
+
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      rc.Name,
@@ -190,6 +330,7 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					SecurityContext: redisPodSecurityContext(),
 					// Plain, single spread rule -- no competing per-pod
 					// exclusion, so HARD is safe here (unlike the
 					// pre-built operator's webhook + balance-rule
@@ -221,29 +362,9 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 							Name:            "redis",
 							Image:           rc.Spec.Image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Env: []corev1.EnvVar{
-								{
-									Name: "POD_IP",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
-									},
-								},
-							},
-							Command: []string{
-								"redis-server",
-								"--port", "6379",
-								"--cluster-enabled", "yes",
-								"--cluster-config-file", "/data/nodes.conf",
-								"--cluster-node-timeout", "5000",
-								"--appendonly", "yes",
-								"--protected-mode", "no",
-								"--bind", "0.0.0.0",
-								// baked in from day one -- this exact
-								// omission caused the stale-gossip
-								// "?:6379" bug we hit twice with the
-								// hand-built cluster.
-								"--cluster-announce-ip", "$(POD_IP)",
-							},
+							SecurityContext: redisContainerSecurityContext(),
+							Env:             env,
+							Command:         command,
 							Ports: []corev1.ContainerPort{
 								{Name: "redis", ContainerPort: 6379},
 								{Name: "gossip", ContainerPort: 16379},
@@ -261,6 +382,27 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 	}, nil
 }
 
+// resolvePassword reads the Redis password from Spec.passwordSecretRef.
+// Returns "" when auth is not configured.
+func (r *RedisClusterReconciler) resolvePassword(ctx context.Context, rc *cachev1.RedisCluster) (string, error) {
+	ref := rc.Spec.PasswordSecretRef
+	if ref == nil || ref.Name == "" || ref.Key == "" {
+		return "", nil
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: rc.Namespace, Name: ref.Name}, &secret); err != nil {
+		return "", fmt.Errorf("reading password secret %q: %w", ref.Name, err)
+	}
+	raw, ok := secret.Data[ref.Key]
+	if !ok {
+		return "", fmt.Errorf("password secret %q missing key %q", ref.Name, ref.Key)
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("password secret %q key %q is empty", ref.Name, ref.Key)
+	}
+	return string(raw), nil
+}
+
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -271,21 +413,33 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("reconciling RedisCluster",
+	log.Info("Reconciling RedisCluster",
 		"name", redisCluster.Name,
 		"nodes", redisCluster.Spec.Nodes,
 		"replicasPerNode", redisCluster.Spec.ReplicasPerNode,
 	)
 
-	// 1. Headless Service -- create if missing. Not updating existing ones
-	// yet; that comes later once this basic create path is proven.
+	password, err := r.resolvePassword(ctx, &redisCluster)
+	if err != nil {
+		log.Error(err, "Failed to resolve Redis password secret")
+		if statusErr := r.setPhaseDetail(ctx, &redisCluster, "Failed", 0, 0,
+			"PasswordSecretUnavailable", err.Error()); statusErr != nil {
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+	if password == "" {
+		log.Info("Redis auth is disabled; set spec.passwordSecretRef for requirepass/masterauth")
+	}
+
+	// 1. Headless Service -- create if missing, reconcile drift.
 	svc := desiredHeadlessService(&redisCluster)
 	if err := ctrl.SetControllerReference(&redisCluster, svc, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 	var existingSvc corev1.Service
 	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &existingSvc); apierrors.IsNotFound(err) {
-		log.Info("creating headless service", "name", svc.Name)
+		log.Info("Creating headless service", "name", svc.Name)
 		if err := r.Create(ctx, svc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("creating headless service: %w", err)
 		}
@@ -296,6 +450,27 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if syncHeadlessService(&existingSvc, svc) {
 		if err := r.Update(ctx, &existingSvc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating headless service: %w", err)
+		}
+	}
+
+	// 1b. NetworkPolicy -- restrict Redis ports to cluster peers + operator.
+	np := desiredNetworkPolicy(&redisCluster)
+	if err := ctrl.SetControllerReference(&redisCluster, np, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+	var existingNP networkingv1.NetworkPolicy
+	if err := r.Get(ctx, client.ObjectKeyFromObject(np), &existingNP); apierrors.IsNotFound(err) {
+		log.Info("Creating NetworkPolicy", "name", np.Name)
+		if err := r.Create(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("creating NetworkPolicy: %w", err)
+		}
+		existingNP = *np
+	} else if err != nil {
+		return ctrl.Result{}, err
+	}
+	if syncNetworkPolicy(&existingNP, np) {
+		if err := r.Update(ctx, &existingNP); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NetworkPolicy: %w", err)
 		}
 	}
 
@@ -422,13 +597,13 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// slots/replicas that are already correct so a mid-flight failure can
 	// recover. A fully formed cluster (all slots + linked replicas) is left
 	// alone even when gossip is temporarily inconsistent.
-	needsWork, err := needsBootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes))
+	needsWork, err := needsBootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes), password)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if needsWork {
 		log.Info("Bootstrapping Redis cluster", "pods", len(nodes), "masters", redisCluster.Spec.Nodes)
-		if err := bootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes)); err != nil {
+		if err := bootstrapOrRepair(ctx, nodes, int(redisCluster.Spec.Nodes), password); err != nil {
 			log.Error(err, "Bootstrap failed, will retry")
 			_ = r.setPhase(ctx, &redisCluster, "Bootstrapping", 0, 0)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -444,11 +619,11 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// pod could answer successfully while its own gossip was still
 	// incomplete after a restart, and the operator trusted it anyway,
 	// once reporting "healthy" with a whole master missing.
-	assessment := assessHealth(ctx, nodes, len(nodes))
+	assessment := assessHealth(ctx, nodes, len(nodes), password)
 	if !assessment.Complete {
 		log.Info("Cluster view not yet consistent across all pods, will retry",
 			"queriedPod", assessment.QueriedPod, "issues", assessment.Issues)
-		if healed, healErr := healClusterMembership(ctx, nodes); healErr != nil {
+		if healed, healErr := healClusterMembership(ctx, nodes, password); healErr != nil {
 			log.Error(healErr, "Cluster membership heal failed")
 		} else if healed {
 			log.Info("Healed cluster membership (FORGET/MEET)")
@@ -481,7 +656,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Only ever act on a view we've confirmed every pod agrees with --
 	// rebalanceMasters must never fire against a partial/stale view,
 	// which could misdiagnose a real imbalance or miss one entirely.
-	if acted, rbErr := rebalanceMasters(ctx, nodes); rbErr != nil {
+	if acted, rbErr := rebalanceMasters(ctx, nodes, password); rbErr != nil {
 		log.Error(rbErr, "Master rebalance check failed")
 		if err := r.setPhaseDetail(ctx, &redisCluster, "Degraded", mastersReady, replicasReady,
 			"UnresolvableMasterImbalance", rbErr.Error()); err != nil {
@@ -640,6 +815,7 @@ func (r *RedisClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1.RedisCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Named("rediscluster").
 		Complete(r)
 }
