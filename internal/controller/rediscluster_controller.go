@@ -82,8 +82,11 @@ func desiredHeadlessService(rc *cachev1.RedisCluster) *corev1.Service {
 			ClusterIP: corev1.ClusterIPNone,
 			Selector:  labelsFor(rc.Name),
 			Ports: []corev1.ServicePort{
-				{Name: "redis", Port: 6379, TargetPort: intstr.FromInt32(6379)},
-				{Name: "gossip", Port: 16379, TargetPort: intstr.FromInt32(16379)},
+				// Protocol is set explicitly: the API server defaults omit-
+				// ted Protocol to TCP, and DeepEqual against that default
+				// would otherwise look like perpetual drift (see syncHeadlessService).
+				{Name: "redis", Port: 6379, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(6379)},
+				{Name: "gossip", Port: 16379, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(16379)},
 			},
 		},
 	}
@@ -217,7 +220,11 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 								InitialDelaySeconds: 5,
 								PeriodSeconds:       5,
 								TimeoutSeconds:      2,
-								FailureThreshold:    3,
+								// SuccessThreshold must match the API default (1).
+								// Leaving it 0 makes syncStatefulSetTemplate see
+								// perpetual drift and never reach bootstrap.
+								SuccessThreshold: 1,
+								FailureThreshold: 3,
 							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
@@ -226,6 +233,7 @@ func desiredStatefulSet(rc *cachev1.RedisCluster) (*appsv1.StatefulSet, error) {
 								InitialDelaySeconds: 15,
 								PeriodSeconds:       10,
 								TimeoutSeconds:      2,
+								SuccessThreshold:    1,
 								FailureThreshold:    3,
 							},
 							VolumeMounts: []corev1.VolumeMount{
