@@ -345,18 +345,22 @@ times in quick succession.
 1. **Fetch the `RedisCluster` object.** If it's gone (`NotFound`), return
    cleanly — nothing to do.
 
-2. **Ensure the headless Service exists.** Create it if missing; not yet
-   updated if it drifts from spec (a known, accepted limitation).
+2. **Reconcile the headless Service.** Create it if missing; otherwise repair
+   its labels, selector, and ports while preserving its allocated cluster IP.
 
-3. **Ensure the StatefulSet exists**, built from the current spec via
-   `desiredStatefulSet`. `ctrl.SetControllerReference` is set on both the
-   Service and StatefulSet — this is what makes Kubernetes automatically
-   garbage-collect them when the `RedisCluster` CR is deleted, and what
-   powers the `Owns()` watches.
+3. **Reconcile the StatefulSet**, built from the current spec via
+   `desiredStatefulSet`. Pod-template changes such as image and resource
+   updates are applied and the controller waits for the new generation and
+   updated pods before issuing Redis commands. Replica-count, service,
+   selector, and PVC-template changes are not applied in place; the status
+   becomes `UnsupportedChange` because Redis resharding and storage migration
+   are not implemented. `ctrl.SetControllerReference` is set on both
+   resources so Kubernetes can garbage-collect them and the controller can
+   watch them.
 
-4. **Gate: are all desired pods `Ready`?** If not, set `status.phase =
-   "Provisioning"` and return — nothing at the Redis level is attempted
-   until every pod actually has a running container.
+4. **Gate: is the current StatefulSet generation fully updated and ready?**
+   If not, set `status.phase = "Provisioning"` and return — nothing at the
+   Redis level is attempted until every desired pod is updated and ready.
 
 5. **List real pods and build `nodeInfo` entries** with `PodName`,
    `K8sNode` (from `pod.Spec.NodeName`), and `IP` (from
@@ -371,19 +375,21 @@ times in quick succession.
    - If **already bootstrapped**: bootstrap logic is never re-run —
      idempotency guard.
 
-7. **Populate real Redis role data into the same `nodes` slice** via
-   `parseClusterNodes`, querying pods until one answers successfully. (This
-   step was the subject of a real bug fixed mid-project — see §6.)
+7. **Require complete cluster views from every Redis pod** via
+   `assessHealth`. If any pod is unreachable or its view has missing peers,
+   failure flags, or incomplete slot coverage, report `Degraded` and retry.
+   Once all views pass, parse roles from a complete view and proceed.
 
-8. **Run `rebalanceMasters`.** If it finds and fixes a same-node master
-   imbalance, requeue after 5 seconds to let the failover settle before the
-   next pass. If it finds an imbalance with no safe single-step fix, log
-   the error but continue — still report best-effort status rather than
-   fail the whole reconcile.
+8. **Run `rebalanceMasters` only on complete cluster data.** If it finds and
+   fixes a same-node master imbalance, requeue after 5 seconds to let the
+   failover settle before the next pass. If it finds an imbalance with no
+   safe single-step fix, log the error but continue — still report
+   best-effort status rather than fail the whole reconcile.
 
 9. **Compute `mastersReady`/`replicasReady`** directly from the already-
    fetched `nodes` data (no redundant second Redis query) and write
-   `status.phase = "Ready"` via `setPhase`.
+   `status.phase = "Ready"` and the `Ready`, `Progressing`, and `Degraded`
+   conditions via `setPhase`.
 
 10. **Always requeue after 30 seconds**, even when nothing changed. This is
     not optional: Kubernetes has no watch mechanism for changes happening
@@ -420,7 +426,7 @@ hypotheticals:
 | `rebalanceMasters` operating on blank data | Real 2-masters-on-one-node imbalance never detected or fixed across many reconcile cycles, no error logged | `rebalanceMasters` was being called on the bare pod-list version of `nodes` (only `PodName`/`K8sNode`/`IP` set) *before* `parseClusterNodes` had ever populated `IsMaster`/`HasSlots`/`NodeID` into that same slice — every `IsMaster` was `false` by Go's zero-value default. Fixed by populating role data in-place before calling the rebalance check. |
 | Leader election timeout | Operator pod stuck retrying `"context deadline exceeded"` against the API server, never started reconciling | Not a code bug — `kube-proxy` was crash-looping cluster-wide from `too many open files`; the host's inotify limits had reverted to OS defaults because an earlier `sudo sysctl` fix was never persisted to `/etc/sysctl.conf`. Fixed by writing the limits permanently and recreating the kind cluster. |
 | Accidentally deleted function header | `apply_fix is not defined` (this one was in the Python reconciler, not Go) | A `str_replace` edit matched text spanning a function boundary and silently dropped the `def apply_fix(...):` line itself, turning its body into dead code nested inside the previous function. Fixed by restoring the header line. |
-| Health check trusted the first pod, not all pods | After a host reboot with 6 pods restarting at different times, the operator reported `"cluster healthy" masters: 2, replicas: 3` — a real master entirely missing from status, with no action taken | The role-population step queried pods in order and stopped at the first one that answered *without erroring* — it never checked whether that pod's own gossip view was actually complete. One pod hadn't finished re-converging and only knew about 5 of 6 real nodes; the operator trusted it anyway. Fixed by replacing the "first responder wins" logic with `assessHealth`, which cross-checks every pod and only trusts a view that passes a full completeness check (right node count, right slot count, no fail flags). `isBootstrapped` was deliberately kept loose rather than also tightened, to avoid a worse failure mode — see §3.2. |
+| Health check trusted one complete view while another pod was stale | A pod could report all nodes and slots while another pod still had stale gossip after a reboot | `assessHealth` now requires every current pod to return a complete view before reporting Ready or attempting master rebalance. `isBootstrapped` remains deliberately permissive to avoid retrying destructive slot assignment on an already-formed but temporarily degraded cluster — see §3.2. |
 
 ---
 

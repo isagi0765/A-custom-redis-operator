@@ -52,6 +52,13 @@ type RedisClusterSpec struct {
 	// storageClassName is the StorageClass used for each node's PVC.
 	// +optional
 	StorageClassName string `json:"storageClassName,omitempty"`
+
+	// passwordSecretRef references a Secret key holding the Redis password.
+	// When set, Redis runs with requirepass/masterauth and protected-mode yes,
+	// and the operator authenticates for all CLUSTER commands.
+	// When unset, Redis stays open (dev/PoC only — combine with NetworkPolicy).
+	// +optional
+	PasswordSecretRef *corev1.SecretKeySelector `json:"passwordSecretRef,omitempty"`
 }
 
 // RedisClusterStatus defines the observed state of RedisCluster.
@@ -74,10 +81,7 @@ type RedisClusterStatus struct {
 	// conditions represent the current state of the RedisCluster resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
+	// Condition types used by this controller are Ready, Progressing, and Degraded.
 	//
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map

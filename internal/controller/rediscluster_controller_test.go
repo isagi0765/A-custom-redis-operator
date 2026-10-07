@@ -21,6 +21,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -54,7 +56,10 @@ var _ = Describe("RedisCluster Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: cachev1.RedisClusterSpec{
+						Nodes:           3,
+						ReplicasPerNode: 1,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
@@ -80,8 +85,31 @@ var _ = Describe("RedisCluster Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			initialSts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, initialSts)).To(Succeed())
+			initialService := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      resourceName + "-headless",
+				Namespace: resourceNamespace,
+			}, initialService)).To(Succeed())
+
+			By("reconciling again without mistaking API defaults for unsupported changes")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			updated := &cachev1.RedisCluster{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Provisioning"))
+			currentSts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, currentSts)).To(Succeed())
+			Expect(currentSts.Generation).To(Equal(initialSts.Generation))
+			currentService := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      resourceName + "-headless",
+				Namespace: resourceNamespace,
+			}, currentService)).To(Succeed())
+			Expect(currentService.Generation).To(Equal(initialService.Generation))
 		})
 	})
 })
